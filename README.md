@@ -479,5 +479,3 @@ Developed as a comprehensive study of DLX pipeline architecture, hazard detectio
 - "Computer Architecture: A Quantitative Approach" - Hennessy & Patterson
 - DLX Instruction Set Reference
 - Pipeline simulation techniques and best practices
-#   d l x - s i m u l a t o r  
- 
