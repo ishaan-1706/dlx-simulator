@@ -1,0 +1,264 @@
+#decoder/decoder.py
+
+# ============================================================
+# DecodedInstruction
+# ============================================================
+# Represents the output of the DECODE stage.
+# Fields default to None because different instruction formats
+# legitimately do NOT use the same fields.
+# ============================================================
+
+class DecodedInstruction:
+    def __init__(
+        self,
+        op,                 # Instruction mnemonic (ADD, LW, BEQ, etc.)
+        instr_type,         # 'R', 'I', or 'J'
+
+        # Register operands
+        rs=None,            # Source register 1
+        rt=None,            # Source register 2 or destination (I-type)
+        rd=None,            # Destination register (R-type)
+
+        # R-type specific
+        shamt=None,         # Shift amount (SLL, SRL, SRA)
+        funct=None,         # Function code (selects R-type op)
+
+        # Immediate / addressing
+        imm=None,           # Sign/zero-extended immediate
+        address=None,       # Raw jump address field
+        target=None         # Fully resolved PC-relative/absolute target
+    ):
+        self.op = op
+        self.type = instr_type
+
+        self.rs = rs
+        self.rt = rt
+        self.rd = rd
+
+        self.shamt = shamt
+        self.funct = funct
+
+        self.imm = imm
+        self.address = address
+        self.target = target
+
+    def __repr__(self):
+    
+        #Full visibility of decoded word for debugging pipelines.
+        
+        return (
+            f"<DecodedInstruction "
+            f"type={self.type} op={self.op} "
+            f"rs={self.rs} rt={self.rt} rd={self.rd} "
+            f"shamt={self.shamt} funct={self.funct} "
+            f"imm={self.imm} address={self.address} target={self.target}>"
+        )
+
+
+# ============================================================
+# Sign extension utilities
+# ============================================================
+
+def sign_extend(value: int, bits: int) -> int:
+    # Generic sign-extension for immediates.
+    sign_bit = 1 << (bits - 1)
+    return (value ^ sign_bit) - sign_bit
+
+
+def sign_extend_16(v: int) -> int:
+    return sign_extend(v, 16)
+
+
+def sign_extend_8(v: int) -> int:
+    return sign_extend(v, 8)
+
+
+def sign_extend_16_zero(v: int) -> int:
+    # Zero-extended immediates (ANDI, ORI, XORI).
+    return v & 0xFFFF
+
+
+# ============================================================
+# Decoder
+# ============================================================
+
+def decode(instruction: int, pc: int = 0) -> DecodedInstruction:
+
+    opcode = (instruction >> 26) & 0x3F
+
+    # ========================================================
+    # R-TYPE (opcode = 0)
+    # ========================================================
+    if opcode == 0x00:
+        rs = (instruction >> 21) & 0x1F
+        rt = (instruction >> 16) & 0x1F
+        rd = (instruction >> 11) & 0x1F
+        shamt = (instruction >> 6) & 0x1F
+        funct = instruction & 0x3F
+
+        # Complete R-type arithmetic + set + shifts + control
+        r_type_map = {
+            0x20: "ADD",
+            0x21: "ADDU",
+            0x22: "SUB",
+            0x23: "SUBU",
+            0x24: "AND",
+            0x25: "OR",
+            0x26: "XOR",
+
+            # SET (comparison)
+            0x2A: "SLT",     # <
+            0x2B: "SLTU",    # < unsigned
+
+            # Shifts
+            0x00: "SLL",
+            0x02: "SRL",
+            0x03: "SRA",
+
+            # Control
+            0x08: "JR",
+            0x09: "JALR",
+        }
+
+        if funct not in r_type_map:
+            raise ValueError(f"Illegal R-type funct {funct}")
+
+        return DecodedInstruction(
+            op=r_type_map[funct],
+            instr_type="R",
+            rs=rs,
+            rt=rt,
+            rd=rd,
+            shamt=shamt,
+            funct=funct
+        )
+
+    # ========================================================
+    # LOAD / STORE (BYTE, HALFWORD, WORD)
+    # ========================================================
+    elif opcode in (
+        0x20,  # LB
+        0x24,  # LBU
+        0x21,  # LH
+        0x25,  # LHU
+        0x23,  # LW
+        0x28,  # SB
+        0x29,  # SH
+        0x2B   # SW
+    ):
+        rs = (instruction >> 21) & 0x1F
+        rt = (instruction >> 16) & 0x1F
+        imm = sign_extend_16(instruction & 0xFFFF)
+
+        op_map = {
+            0x20: "LB",
+            0x24: "LBU",
+            0x21: "LH",
+            0x25: "LHU",
+            0x23: "LW",
+            0x28: "SB",
+            0x29: "SH",
+            0x2B: "SW",
+        }
+
+        return DecodedInstruction(
+            op=op_map[opcode],
+            instr_type="I",
+            rs=rs,
+            rt=rt,
+            imm=imm
+        )
+
+    # ========================================================
+    # BRANCHES — ALL CONDITIONS (including pseudo-instructions for testing)
+    # ========================================================
+    elif opcode in (
+        0x04,  # BEQ
+        0x05,  # BNE
+        0x06,  # BLEZ
+        0x07,  # BGTZ
+        0x10,  # BLT (pseudo-instruction)
+        0x11,  # BGE (pseudo-instruction)
+        0x12,  # BLE (pseudo-instruction)
+        0x13   # BGT (pseudo-instruction)
+    ):
+        rs = (instruction >> 21) & 0x1F
+        rt = (instruction >> 16) & 0x1F
+        imm = sign_extend_16(instruction & 0xFFFF)
+        target = pc + 4 + (imm << 2)
+
+        branch_map = {
+            0x04: "BEQ",     # ==
+            0x05: "BNE",     # !=
+            0x06: "BLEZ",    # <= 0
+            0x07: "BGTZ",    # > 0
+            0x10: "BLT",     # < (pseudo)
+            0x11: "BGE",     # >= (pseudo)
+            0x12: "BLE",     # <= (pseudo)
+            0x13: "BGT",     # > (pseudo)
+        }
+
+        return DecodedInstruction(
+            op=branch_map[opcode],
+            instr_type="I",
+            rs=rs,
+            rt=rt,
+            imm=imm,
+            target=target
+        )
+
+    # ========================================================
+    # IMMEDIATE ARITHMETIC & SET
+    # ========================================================
+    elif opcode in (
+        0x08,  # ADDI
+        0x09,  # ADDIU
+        0x0A,  # SLTI
+        0x0B,  # SLTIU
+        0x0C,  # ANDI
+        0x0D,  # ORI
+        0x0E   # XORI
+    ):
+        rs = (instruction >> 21) & 0x1F
+        rt = (instruction >> 16) & 0x1F
+        imm_raw = instruction & 0xFFFF
+
+        imm_map = {
+            0x08: ("ADDI",  sign_extend_16),
+            0x09: ("ADDIU", sign_extend_16),
+            0x0A: ("SLTI",  sign_extend_16),
+            0x0B: ("SLTIU", sign_extend_16),
+            0x0C: ("ANDI",  sign_extend_16_zero),
+            0x0D: ("ORI",   sign_extend_16_zero),
+            0x0E: ("XORI",  sign_extend_16_zero),
+        }
+
+        op, imm_func = imm_map[opcode]
+
+        return DecodedInstruction(
+            op=op,
+            instr_type="I",
+            rs=rs,
+            rt=rt,
+            imm=imm_func(imm_raw)
+        )
+
+    # ========================================================
+    # JUMPS
+    # ========================================================
+    elif opcode in (0x02, 0x03):
+        address = instruction & 0x3FFFFFF
+        target = ((pc + 4) & 0xF0000000) | (address << 2)
+
+        return DecodedInstruction(
+            op="J" if opcode == 0x02 else "JAL",
+            instr_type="J",
+            address=address,
+            target=target
+        )
+
+    # ========================================================
+    # INVALID INSTRUCTION
+    # ========================================================
+    else:
+        raise ValueError(f"Illegal opcode {opcode}")

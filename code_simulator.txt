@@ -1,0 +1,489 @@
+############################################################
+# PROJECT BUNDLE: SIMULATOR
+# GENERATED ON: 2026-02-04 05:09:36 +0530
+############################################################
+
+from parser.lexer import Lexer
+from parser.asm_parser import Parser
+from parser.assembler import Assembler
+from state.cpu_state import CPUstate
+from pipeline.pipeline import Pipeline
+
+code = """
+ADDI $1, $0, 10
+ADDI $2, $1, 5
+ADDI $3, $2, 5
+SW $1, 4($0)
+LW $4, 4($0)
+NOP
+NOP
+ADD $5, $4, $3
+NOP
+NOP
+NOP
+HALT
+"""
+
+lexer = Lexer(code)
+tokens = lexer.tokenize()
+parser = Parser(tokens)
+instructions = parser.parse()
+assembler = Assembler(instructions)
+machine_code = assembler.assemble()
+
+cpu = CPUstate()
+pipeline = Pipeline()
+
+for idx, instruction in enumerate(machine_code):
+    addr = idx * 4
+    cpu.memory.store_word(addr, instruction)
+
+halted = False
+cycle = 0
+halt_cycle = 0
+for cycle in range(100):
+    pipeline.step(cpu)
+    
+    # Track key events
+    if cycle >= 4 and cycle <= 12:
+        print(f"Cycle {cycle}: PC={hex(cpu.pc)}, $4={cpu.registers.read(4)}, $5={cpu.registers.read(5)}")
+    
+    if cpu.pc < 0 or cpu.pc >= len(machine_code) * 4:
+        if not halted:
+            halted = True
+            halt_cycle = cycle
+        elif cycle >= halt_cycle + 5:
+            break
+
+print(f'\nFinal registers:')
+for i in [1, 2, 3, 4, 5]:
+    print(f'  ${i} = {cpu.registers.read(i)}')
+
+
+from parser.lexer import Lexer
+from parser.asm_parser import Parser
+from parser.assembler import Assembler
+from state.cpu_state import CPUstate
+from pipeline.pipeline import Pipeline
+
+code = """
+ADDI $1, $0, 5
+ADDI $2, $0, 5
+BEQ $1, $2, label2
+ADDI $3, $0, 999
+label2:
+BEQ $1, $2, end
+ADDI $4, $0, 999
+end:
+ADDI $5, $0, 42
+HALT
+"""
+
+lexer = Lexer(code)
+tokens = lexer.tokenize()
+parser = Parser(tokens)
+instructions = parser.parse()
+print("Parsed instructions:")
+for i, inst in enumerate(instructions):
+    print(f"  {i}: {inst.mnemonic} {inst.operands}")
+
+assembler = Assembler(instructions)
+machine_code = assembler.assemble()
+
+print('\nMachine code length:', len(machine_code))
+print('Labels found:', assembler.labels)
+
+cpu = CPUstate()
+pipeline = Pipeline()
+
+for idx, instruction in enumerate(machine_code):
+    addr = idx * 4
+    cpu.memory.store_word(addr, instruction)
+
+print(f"\nRunning for up to 50 cycles...")
+cycle = 0
+for cycle in range(50):
+    print(f"Cycle {cycle}: PC before step={hex(cpu.pc)}")
+    pipeline.step(cpu)
+    print(f"Cycle {cycle}: PC after step={hex(cpu.pc)}, IF/ID.instr={hex(pipeline.if_id.instr) if pipeline.if_id.instr is not None else None}")
+    if cpu.pc < 0 or cpu.pc >= len(machine_code) * 4:
+        print(f"Halt at cycle {cycle}: PC={hex(cpu.pc)}, prog_len={len(machine_code)*4}")
+        break
+
+print('\nFinal registers:')
+for i in [1, 2, 3, 4, 5]:
+    print(f'  ${i} = {cpu.registers.read(i)}')
+print('Total cycles:', cycle)
+
+
+#!/usr/bin/env python3
+"""
+main.py - DLX Simulator Entry Point
+
+This is the main CLI interface for the DLX pipeline simulator. It handles:
+1. Loading assembly files
+2. Assembling code into machine instructions
+3. Running the pipeline simulation
+4. Displaying results
+
+Usage:
+    python main.py <assembly_file> [--cycles N] [--verbose] [--halt-on-zero]
+
+Examples:
+    python main.py program.asm
+    python main.py tests/sample_programs/loop_count.asm --cycles 100 --verbose
+    python main.py simple.asm --halt-on-zero
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+# Import our simulator components
+from parser.lexer import Lexer
+from parser.asm_parser import Parser
+from parser.assembler import Assembler
+from state.cpu_state import CPUstate
+from pipeline.pipeline import Pipeline
+from utils.logger import print_pipeline_state, print_pipeline_summary
+
+
+def load_assembly_file(filepath):
+    """Load and validate assembly file.
+    
+    Args:
+        filepath (str): Path to .asm or .s file
+        
+    Returns:
+        str: File contents as a single string
+        
+    Raises:
+        FileNotFoundError: If file does not exist
+        IOError: If file cannot be read
+    """
+    try:
+        with open(filepath, 'r') as f:
+            return f.read()
+    except FileNotFoundError:
+        print(f"ERROR: File not found: {filepath}", file=sys.stderr)
+        sys.exit(1)
+    except IOError as e:
+        print(f"ERROR: Could not read file {filepath}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def assemble_program(asm_source):
+    """Assemble DLX assembly code into machine instructions.
+    
+    The assembly pipeline is:
+    1. Lexer: Tokenize the assembly source code
+       - Splits into MNEMONIC, REGISTER, IMMEDIATE, LABEL_DEF tokens
+       - Handles comments (# or ;)
+       - Example: "ADDI $1, $0, 5" → [MNEMONIC(ADDI), REGISTER($1), COMMA, REGISTER($0), COMMA, IMMEDIATE(5)]
+    
+    2. Parser: Parse tokens into Instruction objects
+       - Groups tokens into (mnemonic, operands) pairs
+       - Tracks label definitions and their positions
+       - Example: → Instruction(mnemonic='ADDI', operands=['$1', '$0', '5'], label=None)
+    
+    3. Assembler: Convert Instruction objects to 32-bit machine code
+       - Maps mnemonics to opcodes/functs from OPCODES/FUNCTS tables
+       - Encodes register fields, immediates, addresses
+       - Resolves label references to PC-relative offsets
+       - HALT instruction: Generates a NOP (0x00000000), signals pipeline should flush
+       - Returns list of 32-bit integers (machine code)
+    
+    Args:
+        asm_source (str): Assembly code as string
+        
+    Returns:
+        tuple: (machine_code: List[int], has_halt: bool)
+               - machine_code: List of 32-bit instruction words
+               - has_halt: True if program contains HALT instruction (signals 5-cycle flush)
+        
+    Raises:
+        ValueError: If assembly contains invalid syntax or unsupported mnemonics
+        KeyError: If label references are undefined
+    """
+    try:
+        # Step 1: Tokenize
+        lexer = Lexer(asm_source)
+        tokens = lexer.tokenize()
+        
+        # Step 2: Parse tokens into instructions
+        parser = Parser(tokens)
+        instructions = parser.parse()
+        
+        # Step 3: Assemble instructions to machine code
+        assembler = Assembler(instructions)
+        machine_code = assembler.assemble()
+        has_halt = assembler.has_halt
+        
+        return machine_code, has_halt
+    except ValueError as e:
+        print(f"ASSEMBLY ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyError as e:
+        print(f"LABEL ERROR: Undefined label {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"UNEXPECTED ASSEMBLY ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def run_simulation(machine_code, num_cycles, verbose, halt_on_zero, has_halt):
+    """Execute the pipeline simulation with support for HALT instruction flushing.
+    
+    Simulation Flow:
+    1. Initialize CPU state (registers, memory, PC=0)
+    2. Load machine code into memory starting at address 0
+    3. Run pipeline.step() for num_cycles or until halt condition
+    4. If HALT instruction encountered (program_counter reaches end): run 5 more cycles to flush pipeline
+    5. Track cycle count and halt reason
+    
+    HALT Instruction Behavior:
+    - HALT is assembled as a NOP (0x00000000) that marks end of program
+    - When PC goes out of bounds (after last instruction), we know HALT was reached
+    - If has_halt=True, the simulator adds 5 extra cycles to let in-flight instructions finish
+    - This ensures all register writes complete before we report final state
+    - Without this, short programs would show incorrect register values (instructions still in pipeline)
+    
+    Halt conditions:
+    - Reached max cycles specified (normal max limit)
+    - PC goes out of bounds and has_halt=False (abnormal halt)
+    - PC goes out of bounds and has_halt=True, plus 5 flush cycles (normal completion)
+    - --halt-on-zero flag set and $31 (return register) == 0
+    
+    Args:
+        machine_code (list): List of 32-bit instruction words
+        num_cycles (int): Maximum cycles to run before halt (not counting flush cycles)
+        verbose (bool): Print detailed pipeline state each cycle
+        halt_on_zero (bool): Stop if $31 becomes 0
+        has_halt (bool): True if program contains HALT instruction (enables 5-cycle flush)
+        
+    Returns:
+        tuple: (cycle_count, halt_reason, cpu_state, pipeline)
+    """
+    # Initialize CPU state
+    cpu = CPUstate()
+    pipeline = Pipeline()
+    
+    # Load machine code into memory at address 0x0
+    # Each instruction is 4 bytes (word-aligned)
+    for idx, instruction in enumerate(machine_code):
+        addr = idx * 4
+        # Store as 32-bit word (byte order: big-endian by convention)
+        cpu.memory.store_word(addr, instruction)
+    
+    halt_reason = None
+    cycle_count = 0
+    prev_cpu_state = None  # Track previous state for delta display in logger
+    
+    # Simulation loop: run until halt condition or max cycles reached
+    try:
+        for cycle in range(num_cycles):
+            cycle_count = cycle + 1
+            
+            # Run one pipeline cycle
+            # This executes all 5 stages, detects hazards, applies forwarding, flushes on branch
+            pipeline.step(cpu)
+            
+            # Log pipeline state each cycle (if verbose mode enabled)
+            # Passes previous CPU state so logger can show register deltas
+            if verbose:
+                print_pipeline_state(pipeline, cpu, cycle_count, prev_cpu_state=prev_cpu_state, detailed=False)
+            
+            # Save current state for next iteration's delta calculation
+            # We make a shallow copy of the register file values
+            from copy import copy
+            prev_cpu_state = copy(cpu)
+            prev_cpu_state.registers = copy(cpu.registers)
+            
+            # Check halt condition: $31 (return address register) == 0
+            if halt_on_zero and cpu.registers.read(31) == 0:
+                halt_reason = "halt-on-zero ($31 == 0)"
+                break
+            
+            # Check PC bounds: if PC points outside program, halt
+            if cpu.pc < 0 or cpu.pc >= len(machine_code) * 4:
+                # PC is out of bounds = we've tried to fetch beyond the program
+                if cpu.pc == len(machine_code) * 4:
+                    # Normal case: PC is exactly at end of program
+                    # This happens when last instruction's fetch incremented PC
+                    if has_halt:
+                        # HALT instruction present: run 5 more cycles to flush pipeline
+                        halt_reason = "reached-halt (flushing pipeline)"
+                        break  # Break from normal loop, then flush below
+                    else:
+                        halt_reason = "program-counter-end (normal completion)"
+                        break
+                else:
+                    # Abnormal: PC jumped past program end (shouldn't happen normally)
+                    halt_reason = f"invalid-pc ({cpu.pc:#x})"
+                    break
+    
+    except Exception as e:
+        halt_reason = f"error: {e}"
+        print(f"ERROR during simulation: {e}", file=sys.stderr)
+    
+    # HALT FLUSH LOGIC: If program had HALT instruction, run 5 more cycles
+    # This allows in-flight instructions to complete writing back to registers
+    if has_halt and halt_reason == "reached-halt (flushing pipeline)":
+        if verbose:
+            print("\n" + "="*70)
+            print("PIPELINE FLUSH PHASE: Running 5 additional cycles")
+            print("(All in-flight instructions will complete their WB stage)")
+            print("="*70)
+        for flush_cycle in range(5):
+            cycle_count += 1
+            pipeline.step(cpu)
+            if verbose:
+                print_pipeline_state(pipeline, cpu, cycle_count, prev_cpu_state=prev_cpu_state, detailed=False)
+                from copy import copy
+                prev_cpu_state = copy(cpu)
+                prev_cpu_state.registers = copy(cpu.registers)
+        halt_reason = "halt-complete (pipeline flushed)"
+    
+    # If no halt reason set, we hit max cycles
+    if halt_reason is None:
+        halt_reason = f"max-cycles-reached ({num_cycles})"
+    
+    return cycle_count, halt_reason, cpu, pipeline
+
+
+def print_final_state(cpu, cycle_count, halt_reason):
+    """Print final register and memory state.
+    
+    Shows only non-zero registers and memory locations (for brevity).
+    This is called AFTER simulation completes (whether verbose or not).
+    
+    Args:
+        cpu (CPUstate): CPU state to dump
+        cycle_count (int): Total cycles executed
+        halt_reason (str): Why simulation halted
+    """
+    print("\n" + "="*60)
+    print(f"SIMULATION COMPLETE")
+    print("="*60)
+    print(f"Total Cycles: {cycle_count}")
+    print(f"Halt Reason: {halt_reason}")
+    print(f"Final PC:    0x{cpu.pc:04x}")
+    
+    # Print non-zero registers
+    print("\nRegisters (non-zero):")
+    has_nonzero_regs = False
+    for reg_idx in range(32):
+        value = cpu.registers.read(reg_idx)
+        if value != 0:
+            reg_name = f"${reg_idx}"
+            if reg_idx == 0:
+                reg_name = "$zero"
+            elif reg_idx == 31:
+                reg_name = "$31 (RA)"
+            print(f"  {reg_name:10s} = 0x{value:08x} ({value})")
+            has_nonzero_regs = True
+    if not has_nonzero_regs:
+        print("  (all registers are zero)")
+    
+    # Print non-zero memory locations
+    print("\nMemory (non-zero):")
+    has_nonzero_mem = False
+    # Memory is a byte array; check word-aligned locations
+    for addr in range(0, len(cpu.memory.mem), 4):
+        # Read as word (4 bytes)
+        try:
+            value = cpu.memory.load_word(addr)
+            if value != 0:
+                print(f"  [0x{addr:04x}] = 0x{value:08x} ({value})")
+                has_nonzero_mem = True
+        except:
+            pass
+    if not has_nonzero_mem:
+        print("  (no non-zero memory locations)")
+    
+    print("\n" + "="*60)
+
+
+def main():
+    """Main entry point: parse CLI args and run simulator."""
+    parser = argparse.ArgumentParser(
+        description="DLX 5-Stage Pipeline Simulator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py program.asm
+  python main.py tests/sample_programs/loop_count.asm --cycles 100
+  python main.py simple.asm --verbose --halt-on-zero
+        """
+    )
+    
+    parser.add_argument(
+        'assembly_file',
+        help='Path to DLX assembly file (.asm or .s)'
+    )
+    
+    parser.add_argument(
+        '--cycles', '-c',
+        type=int,
+        default=1000,
+        help='Maximum number of cycles to simulate (default: 1000)'
+    )
+    
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Print pipeline state each cycle (verbose output)'
+    )
+    
+    parser.add_argument(
+        '--halt-on-zero',
+        action='store_true',
+        help='Stop simulation when $31 (return address) becomes 0'
+    )
+    
+    args = parser.parse_args()
+    
+    # Step 1: Load assembly file
+    print(f"Loading assembly file: {args.assembly_file}")
+    asm_source = load_assembly_file(args.assembly_file)
+    print(f"  Read {len(asm_source)} characters")
+    
+    # Step 2: Assemble into machine code
+    print(f"Assembling...")
+    machine_code, has_halt = assemble_program(asm_source)
+    print(f"  Assembled {len(machine_code)} instructions")
+    
+    # Step 3: Run simulation
+    print(f"Running simulation (max {args.cycles} cycles)...")
+    if args.verbose:
+        print(f"  Verbose mode enabled\n")
+    
+    cycle_count, halt_reason, cpu, pipeline = run_simulation(
+        machine_code,
+        args.cycles,
+        args.verbose,
+        args.halt_on_zero,
+        has_halt
+    )
+    
+    # Step 4: Print results
+    print_final_state(cpu, cycle_count, halt_reason)
+
+
+if __name__ == '__main__':
+    main()
+
+
+from parser.lexer import Lexer
+
+code = """
+ADDI $1, $31, 1
+"""
+
+lexer = Lexer(code)
+tokens = lexer.tokenize()
+print("Tokens:")
+for tok in tokens:
+    print(f"  {tok}")
+
+

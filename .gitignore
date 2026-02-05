@@ -1,0 +1,98 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+ENV/
+env/
+simsim/
+sim_dlx/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Images and documentation (build artifacts)
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Build artifacts
+*.o
+*.a
+*.so
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+
+# Note: Debug files (test_lex.py, debug_test.py, debug_forward.py) are intentionally kept
+# Note: Custom bundler scripts are intentionally kept
+# Note: Tests and sample programs are intentionally kept
+
+# Project-specific generated / user files
+*_code.txt
+*_bundler.py
+
+# Node / Python caches
+__pycache__/
+.pytest_cache/
+
+# User programs directory (user-managed)
+user_programs/
+
+# Virtualenvs created by helpers
+# Use simsim (project venv) - ignore it
+simsim/
+sim_venv/
+sim_venv
+
+# Batch/sh helper scripts (optional - keep in repo if you want them tracked)
+# If you prefer to keep helper scripts out of commits, uncomment the next line:
+# scripts/
+
+# Editor temporary files
+*.log
+*.bak
+
+# Ignore any assembly files placed at repository root (local testing files)
+/*.asm
+
+# Ignore project planning/details (outdated)
+project_details/
+
+

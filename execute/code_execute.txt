@@ -1,0 +1,135 @@
+############################################################
+# PROJECT BUNDLE: EXECUTE
+# GENERATED ON: 2026-02-04 05:02:17 +0530
+############################################################
+
+#execute/__init__.py
+from .alu import alu
+from .branch_unit import branch
+from .load_store_unit import load_store
+
+__all__ = ["alu", "branch", "load_store"]
+
+#execute/alu.py
+
+
+def alu(op: str, a: int, b: int, shamt: int = 0) -> int:
+    """
+    Arithmetic Logic Unit (ALU).
+    Executes R-type and I-type arithmetic/logic instructions.
+    """
+    if op == "ADD": return a + b
+    if op == "ADDU": return (a + b) & 0xFFFFFFFF
+    if op == "SUB": return a - b
+    if op == "SUBU": return (a - b) & 0xFFFFFFFF
+    if op == "AND": return a & b
+    if op == "OR":  return a | b
+    if op == "XOR": return a ^ b
+    if op == "NOR": return ~(a | b) & 0xFFFFFFFF
+    if op == "SLT": return 1 if a < b else 0
+    if op == "SLTU": return 1 if (a & 0xFFFFFFFF) < (b & 0xFFFFFFFF) else 0
+    if op == "SLL": return (b << shamt) & 0xFFFFFFFF
+    if op == "SRL": return (b & 0xFFFFFFFF) >> shamt
+    if op == "SRA": return b >> shamt
+    raise ValueError(f"Unsupported ALU op {op}")
+
+#execute/branch_unit.py
+
+
+def branch(op: str, rs_val: int, rt_val: int, target: int, pc: int, link_reg: int | None = None):
+    # Branch Unit.
+    # Computes next PC (or next PC + link info for link-returning jumps) based on
+    # branch/jump instructions. Returns either an int next_pc or a tuple
+    # (next_pc, link_reg, link_val) for link-producing jumps (e.g., JALR).
+
+    # Equality/inequality
+    if op == 'BEQ' and rs_val == rt_val:
+        return target
+    if op == 'BNE' and rs_val != rt_val:
+        return target
+
+    # Signed comparisons against zero
+    if op == 'BLEZ' and rs_val <= 0:
+        return target
+    if op == 'BGTZ' and rs_val > 0:
+        return target
+
+    # Register-vs-register comparisons
+    if op == 'BLT' and rs_val < rt_val:
+        return target
+    if op == 'BGE' and rs_val >= rt_val:
+        return target
+    if op == 'BLE' and rs_val <= rt_val:
+        return target
+    if op == 'BGT' and rs_val > rt_val:
+        return target
+
+    # Absolute jumps
+    if op in ('J', 'JAL'):
+        return target
+
+    # JR and JALR
+    if op == 'JR':
+        return rs_val
+
+    if op == 'JALR':
+        if link_reg is None:
+            raise ValueError('JALR requires a destination register (link_reg)')
+        # Return tuple: (next_pc, link_reg, link_value)
+        return (rs_val, link_reg, pc + 4)
+
+    # default fall-through
+    return pc + 4  # default fall-through
+
+#execute/load_store_unit.py
+
+from typing import Optional
+
+
+def _sign_extend(value: int, bits: int) -> int:
+    sign_bit = 1 << (bits - 1)
+    return (value ^ sign_bit) - sign_bit
+
+
+# Load/Store Unit.
+# Executes memory access instructions. Returns the loaded value for loads,
+# and None for stores.
+# Supported ops: LW, SW, LB, LBU, LH, LHU, SB, SH
+def load_store(op: str, memory, addr: int, rt_val: Optional[int] = None) -> Optional[int]:
+    # Validate that store operations include a value for rt_val
+    if op in ('SW', 'SB', 'SH') and rt_val is None:
+        raise ValueError('Store operations require rt_val')
+    if op == 'LW':
+        return memory.load_word(addr)
+
+    if op == 'SW':
+        memory.store_word(addr, rt_val)
+        return None
+
+    # Byte loads/stores
+    if op == 'LB':
+        val = memory.load_byte(addr)
+        return _sign_extend(val, 8)
+
+    if op == 'LBU':
+        return memory.load_byte(addr) & 0xFF
+
+    if op == 'SB':
+        memory.store_byte(addr, rt_val)
+        return None
+
+    # Halfword loads/stores
+    if op == 'LH':
+        val = memory.load_half(addr)
+        return _sign_extend(val, 16)
+
+    if op == 'LHU':
+        return memory.load_half(addr) & 0xFFFF
+
+    if op == 'SH':
+        memory.store_half(addr, rt_val)
+        return None
+
+    # Extend later: other memory ops
+    raise ValueError(f'Unsupported memory op {op}')
+

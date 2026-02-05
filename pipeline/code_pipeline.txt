@@ -1,0 +1,459 @@
+############################################################
+# PROJECT BUNDLE: PIPELINE
+# GENERATED ON: 2026-02-04 05:24:04 +0530
+############################################################
+
+# pipeline/hazards.py
+from typing import List, Tuple, Optional
+
+
+# All branch and jump instructions
+BRANCH_INSTRUCTIONS = {
+    'BEQ', 'BNE', 'BLEZ', 'BGTZ', 'BLT', 'BGE', 'BLE', 'BGT',  # conditional branches
+    'J', 'JAL',  # unconditional jumps
+    'JR', 'JALR'  # register jumps
+}
+
+
+def is_branch(op: Optional[str]) -> bool:
+    """Check if an instruction is a branch or jump."""
+    return op in BRANCH_INSTRUCTIONS
+
+
+def evaluate_branch(op: str, rs_val: int, rt_val: int) -> bool:
+    """Evaluate if a branch should be taken.
+
+    Returns True if the branch condition is satisfied, False otherwise.
+    Note: J, JAL, JR, JALR are always taken.
+    """
+    if op == 'BEQ':
+        return rs_val == rt_val
+    elif op == 'BNE':
+        return rs_val != rt_val
+    elif op == 'BLEZ':
+        return rs_val <= 0
+    elif op == 'BGTZ':
+        return rs_val > 0
+    elif op == 'BLT':
+        return rs_val < rt_val
+    elif op == 'BGE':
+        return rs_val >= rt_val
+    elif op == 'BLE':
+        return rs_val <= rt_val
+    elif op == 'BGT':
+        return rs_val > rt_val
+    elif op in ('J', 'JAL', 'JR', 'JALR'):
+        # Unconditional jumps are always taken
+        return True
+    else:
+        return False
+
+
+def detect_raw(id_ex_reg, ex_mem_reg, mem_wb_reg) -> List[str]:
+    """Detect Read-After-Write hazards by comparing register numbers.
+
+    Compares ID/EX source registers (rs, rt) against EX/MEM.rd and MEM/WB.rd.
+    Returns a list of human-readable hazard descriptions (empty if none).
+    """
+    hazards: List[str] = []
+    for src_name in ('rs', 'rt'):
+        src = getattr(id_ex_reg, src_name, None)
+        if src is None:
+            continue
+        if ex_mem_reg.rd is not None and src == ex_mem_reg.rd and ex_mem_reg.rd != 0:
+            hazards.append(f"RAW between ID/EX.{src_name} and EX/MEM.rd (${ex_mem_reg.rd})")
+        if mem_wb_reg.rd is not None and src == mem_wb_reg.rd and mem_wb_reg.rd != 0:
+            hazards.append(f"RAW between ID/EX.{src_name} and MEM/WB.rd (${mem_wb_reg.rd})")
+    return hazards
+
+
+def forwarding(id_ex_reg, ex_mem_reg, mem_wb_reg):
+    """Apply forwarding to ID/EX values if possible.
+
+    This updates id_ex_reg.rs_val and id_ex_reg.rt_val when a matching producer
+    exists in EX/MEM or MEM/WB with an available value (alu_result or mem_data).
+    
+    Note: For load operations in EX/MEM, we don't forward the address (alu_result)
+    because the actual loaded value hasn't been computed yet. We wait for MEM/WB.
+    """
+    # Forward from EX/MEM first (most recent), but NOT from loads
+    # (loads have the address in alu_result, not the loaded value)
+    is_load_in_ex = ex_mem_reg.mem_op in ("LW", "LB", "LBU", "LH", "LHU")
+    if not is_load_in_ex and ex_mem_reg.rd is not None and ex_mem_reg.alu_result is not None and ex_mem_reg.rd != 0:
+        if id_ex_reg.rs == ex_mem_reg.rd:
+            id_ex_reg.rs_val = ex_mem_reg.alu_result
+        if id_ex_reg.rt == ex_mem_reg.rd:
+            id_ex_reg.rt_val = ex_mem_reg.alu_result
+
+    # Then from MEM/WB (if not already forwarded)
+    if mem_wb_reg.rd is not None and mem_wb_reg.rd != 0:
+        wb_val = mem_wb_reg.mem_data if mem_wb_reg.mem_data is not None else mem_wb_reg.alu_result
+        if wb_val is None:
+            return
+        if id_ex_reg.rs == mem_wb_reg.rd and id_ex_reg.rs_val is None:
+            id_ex_reg.rs_val = wb_val
+        if id_ex_reg.rt == mem_wb_reg.rd and id_ex_reg.rt_val is None:
+            id_ex_reg.rt_val = wb_val
+
+
+def detect_load_use_hazard(id_ex_reg, ex_mem_reg) -> bool:
+    """Detect a load-use hazard: ID/EX instruction uses a register being loaded in EX/MEM.
+
+    Returns True if a stall is needed, False otherwise.
+    A load-use hazard occurs when:
+    - EX/MEM has a load operation (LW, LB, LBU, LH, LHU)
+    - ID/EX reads the same register that EX/MEM is loading into
+    """
+    if ex_mem_reg.mem_op is None or ex_mem_reg.rd is None or ex_mem_reg.rd == 0:
+        return False
+
+    # Check if it's a load operation
+    is_load = ex_mem_reg.mem_op in ("LW", "LB", "LBU", "LH", "LHU")
+    if not is_load:
+        return False
+
+    # Check if ID/EX reads the register being loaded
+    if id_ex_reg.rs == ex_mem_reg.rd or id_ex_reg.rt == ex_mem_reg.rd:
+        return True
+
+    return False
+
+
+def detect_branch_taken(ex_mem_reg) -> Tuple[bool, Optional[int]]:
+    """Detect if a branch in EX/MEM is taken and return target address.
+    
+    Returns (is_taken, target_address) where:
+    - is_taken: True if the branch condition is met (or it's an unconditional jump)
+    - target_address: PC address to jump to, or None if branch not taken
+    
+    This function is called after the EX stage so branch_target is already computed.
+    """
+    if ex_mem_reg.op is None or not is_branch(ex_mem_reg.op):
+        return False, None
+    
+    # Get the operand values from EX/MEM (they've been forwarded from earlier stages)
+    rs_val = ex_mem_reg.rs_val if ex_mem_reg.rs_val is not None else 0
+    rt_val = ex_mem_reg.rt_val if ex_mem_reg.rt_val is not None else 0
+    
+    # Evaluate the branch condition
+    taken = evaluate_branch(ex_mem_reg.op, rs_val, rt_val)
+    
+    if taken:
+        # Return the target address (computed during decode)
+        return True, ex_mem_reg.branch_target
+    else:
+        return False, None
+
+
+# pipeline/pipeline.py
+from pipeline.pipeline_regs import IF_ID, ID_EX, EX_MEM, MEM_WB
+from pipeline.pipeline_stages import IF, ID, EX, MEM, WB
+from pipeline.hazards import forwarding, detect_raw, detect_load_use_hazard, detect_branch_taken
+
+class Pipeline:
+    """5-stage pipeline controller with stall and flush logic.
+
+    This controller manages the pipeline registers and detects/handles hazards:
+    - Stall on load-use hazards (prevent IF/ID and ID/EX advancement)
+    - Flush on demand (clear pipeline registers on mispredicted branches)
+    """
+    def __init__(self):
+        # current pipeline register state
+        self.if_id = IF_ID()
+        self.id_ex = ID_EX()
+        self.ex_mem = EX_MEM()
+        self.mem_wb = MEM_WB()
+
+        # next pipeline register state container (created each cycle)
+        self.next_if_id = IF_ID()
+        self.next_id_ex = ID_EX()
+        self.next_ex_mem = EX_MEM()
+        self.next_mem_wb = MEM_WB()
+        
+        # cycle counter for debugging
+        self.cycle = 0
+
+    def step(self, cpu):
+        """Perform one pipeline cycle with hazard detection and control.
+        
+        1. Check for load-use hazard; if detected, stall IF/ID and ID/EX (and insert NOP in EX)
+        2. Run stages (WB, MEM, EX, ID, IF) appropriately based on stall/flush
+        3. Check for branch taken in next_ex_mem (just computed by EX); if taken, flush pipeline and redirect PC
+        4. Apply forwarding
+        5. Commit pipeline registers
+        """
+        self.cycle += 1
+        
+        # Check for load-use hazard between current ID/EX and current EX/MEM
+        stall_requested = detect_load_use_hazard(self.id_ex, self.ex_mem)
+        
+        # WRITEBACK stage (always runs)
+        WB(cpu, self.mem_wb)
+
+        # MEM stage (always runs)
+        MEM(cpu, self.ex_mem, self.next_mem_wb)
+
+        # EX stage: if stalling, insert NOP (clear); otherwise execute current ID/EX
+        if stall_requested:
+            # Stall: insert a NOP into the pipeline (clear EX/MEM)
+            self.next_ex_mem.clear()
+        else:
+            # Normal: execute current ID/EX
+            EX(self.id_ex, self.next_ex_mem)
+
+        # Check for branch taken in next_ex_mem (the result of EX stage this cycle)
+        branch_taken, branch_target = detect_branch_taken(self.next_ex_mem)
+
+        # ID stage: if stalling, hold ID/EX; otherwise decode next instruction
+        if stall_requested:
+            # Stall: restore instruction info but clear operand values so forwarding refills them
+            self.next_id_ex.pc = self.id_ex.pc
+            self.next_id_ex.op = self.id_ex.op
+            self.next_id_ex.rs = self.id_ex.rs
+            self.next_id_ex.rt = self.id_ex.rt
+            self.next_id_ex.rd = self.id_ex.rd
+            self.next_id_ex.imm = self.id_ex.imm
+            self.next_id_ex.shamt = self.id_ex.shamt
+            # Clear operand values so they can be re-forwarded from updated pipeline state
+            # But preserve values for register $0 (always 0, no forwarding needed)
+            self.next_id_ex.rs_val = None if self.id_ex.rs != 0 else self.id_ex.rs_val
+            self.next_id_ex.rt_val = None if self.id_ex.rt != 0 else self.id_ex.rt_val
+        else:
+            # Normal: decode next instruction
+            ID(cpu, self.if_id, self.next_id_ex)
+
+        # Apply forwarding (even during stall, as values may have become available)
+        forwarding(self.next_id_ex, self.ex_mem, self.mem_wb)
+        forwarding(self.next_id_ex, self.next_ex_mem, self.next_mem_wb)
+
+        # IF stage: if stalling, hold IF/ID; otherwise fetch next instruction
+        if stall_requested:
+            # Stall: copy current IF/ID to next (no new fetch, don't advance PC)
+            self.next_if_id.pc = self.if_id.pc
+            self.next_if_id.instr = self.if_id.instr
+        else:
+            # Normal: fetch next instruction
+            IF(cpu, self.next_if_id)
+
+        # Handle branch taken: flush pipeline and redirect PC
+        # This must happen BEFORE commit so the flushed state is used next cycle
+        if branch_taken and branch_target is not None:
+            # Flush the next IF/ID (clear fetched instruction that came after branch)
+            self.next_if_id.clear()
+            # Flush the next ID/EX (clear decoded instruction that came after branch)
+            self.next_id_ex.clear()
+            # Redirect PC to branch target for next cycle
+            cpu.pc = branch_target
+
+        # Commit: advance register snapshots
+        self.if_id = self.next_if_id
+        self.id_ex = self.next_id_ex
+        self.ex_mem = self.next_ex_mem
+        self.mem_wb = self.next_mem_wb
+
+        # Allocate fresh next-stage containers for the next cycle
+        self.next_if_id = IF_ID()
+        self.next_id_ex = ID_EX()
+        self.next_ex_mem = EX_MEM()
+        self.next_mem_wb = MEM_WB()
+
+    def flush(self):
+        """Flush all pipeline registers (e.g., after a taken branch)."""
+        self.if_id.clear()
+        self.id_ex.clear()
+        self.ex_mem.clear()
+        self.mem_wb.clear()
+
+
+# pipeline/pipeline_regs.py
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class IF_ID:
+    pc: int = 0
+    instr: Optional[int] = None
+
+    def clear(self):
+        self.pc = 0
+        self.instr = None
+
+
+@dataclass
+class ID_EX:
+    pc: int = 0
+    rs: Optional[int] = None  # register number
+    rt: Optional[int] = None  # register number
+    rs_val: Optional[int] = None
+    rt_val: Optional[int] = None
+    rd: Optional[int] = None
+    imm: Optional[int] = None
+    op: Optional[str] = None
+    shamt: Optional[int] = None  # shift amount for shift operations
+    branch_target: Optional[int] = None  # target address for branches/jumps
+
+    def clear(self):
+        self.pc = 0
+        self.rs = None
+        self.rt = None
+        self.rs_val = None
+        self.rt_val = None
+        self.rd = None
+        self.imm = None
+        self.op = None
+        self.shamt = None
+        self.branch_target = None
+
+
+@dataclass
+class EX_MEM:
+    pc: int = 0
+    op: Optional[str] = None  # operation (for branch detection)
+    alu_result: Optional[int] = None
+    rt_val: Optional[int] = None
+    rs_val: Optional[int] = None  # rs_val needed for branch evaluation
+    rd: Optional[int] = None
+    mem_op: Optional[str] = None
+    branch_target: Optional[int] = None  # target address for branches
+
+    def clear(self):
+        self.pc = 0
+        self.op = None
+        self.alu_result = None
+        self.rt_val = None
+        self.rs_val = None
+        self.rd = None
+        self.mem_op = None
+        self.branch_target = None
+
+
+@dataclass
+class MEM_WB:
+    pc: int = 0
+    mem_data: Optional[int] = None
+    alu_result: Optional[int] = None
+    rd: Optional[int] = None
+
+    def clear(self):
+        self.pc = 0
+        self.mem_data = None
+        self.alu_result = None
+        self.rd = None
+
+
+# pipeline/pipeline_stages.py
+from decoder.decoder import decode
+from execute.alu import alu
+from execute.branch_unit import branch
+from execute.load_store_unit import load_store
+
+
+def IF(cpu, next_if_id):
+    """Instruction Fetch: read the instruction at PC and write into next IF/ID register.
+
+    This function advances the CPU PC so that the next IF sees the next instruction.
+    """
+    instr_word = cpu.memory.load_word(cpu.pc)
+    next_if_id.pc = cpu.pc
+    next_if_id.instr = instr_word
+    cpu.step_pc()
+
+
+def ID(cpu, cur_if_id, next_id_ex):
+    """Instruction Decode: read `cur_if_id.instr` and populate `next_id_ex`.
+
+    This copies register numbers and values into ID/EX so later stages have the
+    necessary information for execution and hazard detection.
+    """
+    if cur_if_id.instr is None:
+        next_id_ex.clear()
+        return
+
+    dec = decode(cur_if_id.instr, pc=cur_if_id.pc)
+    next_id_ex.pc = cur_if_id.pc
+    next_id_ex.op = dec.op
+    next_id_ex.rs = dec.rs
+    next_id_ex.rt = dec.rt
+    next_id_ex.rs_val = cpu.registers.read(dec.rs) if dec.rs is not None else None
+    next_id_ex.rt_val = cpu.registers.read(dec.rt) if dec.rt is not None else None
+    next_id_ex.rd = dec.rd
+    next_id_ex.imm = dec.imm
+    next_id_ex.shamt = dec.shamt  # Shift amount for shift operations
+    next_id_ex.branch_target = dec.target  # Store branch/jump target
+
+
+def EX(cur_id_ex, next_ex_mem):
+    """Execute stage: perform ALU ops or compute memory addresses and write to next EX/MEM."""
+    next_ex_mem.clear()
+    next_ex_mem.pc = cur_id_ex.pc
+    next_ex_mem.op = cur_id_ex.op  # Carry forward op for branch detection
+    next_ex_mem.rs_val = cur_id_ex.rs_val  # Carry forward rs_val for branch evaluation
+    next_ex_mem.rt_val = cur_id_ex.rt_val  # Carry forward rt_val for branch evaluation
+    next_ex_mem.branch_target = cur_id_ex.branch_target  # Carry forward branch target
+
+    op = cur_id_ex.op
+    if op is None:
+        return
+
+    # R-type arithmetic/logic
+    if op in ("ADD", "ADDU", "SUB", "SUBU", "AND", "OR", "XOR", "SLT", "SLTU"):
+        # Guard: operands must be available after forwarding
+        if cur_id_ex.rs_val is None or cur_id_ex.rt_val is None:
+            # Incomplete forwarding (should not happen if hazard unit is correct)
+            return
+        next_ex_mem.alu_result = alu(op, cur_id_ex.rs_val, cur_id_ex.rt_val, shamt=cur_id_ex.shamt or 0)
+        next_ex_mem.rd = cur_id_ex.rd
+
+    # I-type immediate arithmetic/logical
+    elif op in ("ADDI", "ADDIU"):
+        if cur_id_ex.rs_val is None:
+            return
+        next_ex_mem.alu_result = alu('ADD' if op == 'ADDI' else 'ADDU', cur_id_ex.rs_val, cur_id_ex.imm)
+        next_ex_mem.rd = cur_id_ex.rt
+    elif op in ("ANDI", "ORI", "XORI"):
+        if cur_id_ex.rs_val is None:
+            return
+        op_map = {"ANDI": "AND", "ORI": "OR", "XORI": "XOR"}
+        next_ex_mem.alu_result = alu(op_map[op], cur_id_ex.rs_val, cur_id_ex.imm)
+        next_ex_mem.rd = cur_id_ex.rt
+
+    # Load/store address computation
+    elif op in ("LW", "SW", "LB", "LBU", "LH", "LHU", "SB", "SH"):
+        if cur_id_ex.rs_val is None:
+            return
+        next_ex_mem.alu_result = cur_id_ex.rs_val + (cur_id_ex.imm or 0)
+        next_ex_mem.rt_val = cur_id_ex.rt_val
+        next_ex_mem.rd = cur_id_ex.rt
+        next_ex_mem.mem_op = op
+
+    else:
+        # For unimplemented ops, do nothing except forward pc
+        pass
+
+
+def MEM(cpu, cur_ex_mem, next_mem_wb):
+    """Memory stage: perform loads/stores and prepare writeback values."""
+    next_mem_wb.clear()
+    next_mem_wb.pc = cur_ex_mem.pc
+
+    if cur_ex_mem.mem_op == "LW":
+        next_mem_wb.mem_data = load_store("LW", cpu.memory, cur_ex_mem.alu_result)
+        next_mem_wb.rd = cur_ex_mem.rd
+    elif cur_ex_mem.mem_op == "SW":
+        load_store("SW", cpu.memory, cur_ex_mem.alu_result, cur_ex_mem.rt_val)
+    elif cur_ex_mem.mem_op in ("LB", "LBU", "LH", "LHU"):
+        next_mem_wb.mem_data = load_store(cur_ex_mem.mem_op, cpu.memory, cur_ex_mem.alu_result)
+        next_mem_wb.rd = cur_ex_mem.rd
+    else:
+        next_mem_wb.alu_result = cur_ex_mem.alu_result
+        next_mem_wb.rd = cur_ex_mem.rd
+
+
+def WB(cpu, cur_mem_wb):
+    """Writeback: commit results to the register file."""
+    if cur_mem_wb.rd is not None:
+        val = cur_mem_wb.mem_data if cur_mem_wb.mem_data is not None else cur_mem_wb.alu_result
+        if val is not None:
+            cpu.registers.write(cur_mem_wb.rd, val)
+

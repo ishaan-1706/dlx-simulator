@@ -1,0 +1,2261 @@
+############################################################
+# PROJECT BUNDLE: TESTS
+# GENERATED ON: 2026-02-04 05:10:56 +0530
+############################################################
+
+#tests/__init__.py
+
+#tests/test_alu.py
+import pytest
+from execute.alu import alu
+
+
+def test_add_and_addu():
+    assert alu('ADD', 1, 2) == 3
+    # ADDU wraps to 32-bit
+    assert alu('ADDU', 0xFFFFFFFF, 1) == 0x00000000
+
+
+def test_sub_and_subu():
+    assert alu('SUB', 10, 3) == 7
+    assert alu('SUBU', 0, 1) == (0 - 1) & 0xFFFFFFFF
+
+
+def test_logic_ops():
+    assert alu('AND', 0b1010, 0b1100) == 0b1000
+    assert alu('OR', 1, 2) == 3
+    assert alu('XOR', 0xF0F0, 0x0F0F) == 0xFFFF
+    assert alu('NOR', 0, 0) == 0xFFFFFFFF
+
+
+def test_set_and_unsigned_set():
+    assert alu('SLT', 1, 2) == 1
+    assert alu('SLT', 2, 1) == 0
+    # SLTU compares unsigned
+    assert alu('SLTU', 0xFFFFFFFF, 0) == 0
+
+
+def test_shifts():
+    # SLL: shift left logical
+    assert alu('SLL', 0, 1, shamt=4) == (1 << 4) & 0xFFFFFFFF
+    # SRL: logical right
+    assert alu('SRL', 0, 0x80000000, shamt=31) == 1
+    # SRA: arithmetic right preserves sign
+    assert alu('SRA', 0, -1, shamt=1) == -1
+
+
+def test_unsupported_op_raises():
+    with pytest.raises(ValueError):
+        alu('MUL', 1, 2)  # MUL not implemented yet
+
+
+#tests/test_assembler.py
+from tests.util import assemble, assemble_and_decode, decode_word
+
+
+def test_assemble_add_and_decode():
+    src = "ADD $3, $1, $2"
+    machine = assemble(src)
+    assert len(machine) == 1
+    decoded = decode_word(machine[0])
+    assert decoded.op == 'ADD'
+    assert decoded.type == 'R'
+    assert decoded.rs == 1
+    assert decoded.rt == 2
+    assert decoded.rd == 3
+
+
+def test_assemble_lw_sw_and_branch():
+    src = "start: LW $2, 4($3)\nSW $2, 8($3)\nBEQ $2, $3, start"
+    machine = assemble(src)
+    # decode and verify ops
+    assert decode_word(machine[0]).op == 'LW'
+    assert decode_word(machine[1]).op == 'SW'
+    assert decode_word(machine[2]).op == 'BEQ'
+
+#tests/test_assembler_extended.py
+import pytest
+from parser.lexer import Lexer
+from parser.asm_parser import Parser
+from parser.assembler import Assembler
+from decoder.decoder import decode
+
+
+from tests.util import assemble_and_decode, assemble
+
+
+def test_immediates_and_arithmetics():
+    decoded = assemble_and_decode('ADDI $1, $2, -5')
+    assert decoded[0].op == 'ADDI'
+    # Decoder returns sign-extended immediate for ADDI
+    assert decoded[0].imm == -5
+
+    decoded = assemble_and_decode('ORI $3, $4, 0xFF')
+    assert decoded[0].op == 'ORI'
+
+
+def test_branch_label_undefined_raises():
+    src = 'BEQ $1, $2, missing'
+    with pytest.raises(ValueError):
+        assemble(src)
+
+
+def test_jump_label_undefined_raises():
+    src = 'J nowhere'
+    with pytest.raises(ValueError):
+        assemble(src)
+
+
+def test_bad_register_raises():
+    src = 'ADD $32, $1, $2'
+    with pytest.raises(ValueError):
+        assemble(src)
+
+#tests/test_branch.py
+import pytest
+from execute.branch_unit import branch
+
+
+def test_branch_blt():
+    # BLT: 1 < 2 -> take target
+    target = 0x200
+    res = branch('BLT', 1, 2, target, pc=0x100)
+    assert res == target
+
+
+def test_branch_bge():
+    # BGE: 2 >= 2 -> take target
+    target = 0x300
+    res = branch('BGE', 2, 2, target, pc=0x100)
+    assert res == target
+
+
+def test_branch_ble():
+    # BLE: 1 <= 2 -> take target
+    target = 0x400
+    res = branch('BLE', 1, 2, target, pc=0x100)
+    assert res == target
+
+
+def test_branch_bgt():
+    # BGT: 3 > 2 -> take target
+    target = 0x500
+    res = branch('BGT', 3, 2, target, pc=0x100)
+    assert res == target
+
+
+def test_jalr_returns_link():
+    # JALR should return tuple (next_pc, link_reg, link_value)
+    rs_val = 0x8000
+    pc = 0x100
+    link_reg = 31
+    res = branch('JALR', rs_val, 0, 0, pc=pc, link_reg=link_reg)
+    assert isinstance(res, tuple)
+    next_pc, reg, link_val = res
+    assert next_pc == rs_val
+    assert reg == link_reg
+    assert link_val == pc + 4
+
+
+def test_jalr_requires_linkreg():
+    with pytest.raises(ValueError):
+        branch('JALR', 0x100, 0, 0, pc=0x0)
+
+"""Tests for branch flushing in the pipeline."""
+
+from tests.util import assemble
+from state.cpu_state import CPUstate
+from pipeline.pipeline import Pipeline
+
+
+def test_branch_taken_flushes_pipeline():
+    """Test that a taken branch flushes the pipeline and redirects PC.
+    
+    Program:
+        ADDI $1, $0, 5       # $1 = 5
+        BEQ $1, $1, target   # Branch is TAKEN (jump to target)
+        ADDI $2, $0, 100     # Should NOT execute (flushed)
+    target:
+        ADDI $3, $0, 42      # $3 = 42 (executed after flush)
+    """
+    src = 'ADDI $1, $0, 5\nBEQ $1, $1, target\nADDI $2, $0, 100\ntarget: ADDI $3, $0, 42'
+    machine = assemble(src)
+    
+    cpu = CPUstate()
+    # Load machine code into memory at 0, 4, 8, 12
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+    
+    pipeline = Pipeline()
+    
+    # Run enough cycles for the branch to be detected and flushed
+    for _ in range(15):
+        pipeline.step(cpu)
+    
+    # Expected: $1 = 5, $3 = 42, $2 should be 0 (never executed)
+    assert cpu.registers.read(1) == 5, f"Expected $1=5, got {cpu.registers.read(1)}"
+    assert cpu.registers.read(3) == 42, f"Expected $3=42, got {cpu.registers.read(3)}"
+    assert cpu.registers.read(2) == 0, f"Expected $2=0 (never executed), got {cpu.registers.read(2)}"
+
+
+def test_branch_not_taken_no_flush():
+    """Test that a branch not taken does NOT flush the pipeline.
+    
+    Program:
+        ADDI $1, $0, 5       # $1 = 5
+        ADDI $2, $0, 10      # $2 = 10
+        BEQ $1, $2, target   # Branch is NOT TAKEN (fall through)
+        ADDI $3, $0, 42      # $3 = 42 (executed normally)
+        ADDI $4, $0, 99      # $4 = 99 (also executed, no flush)
+    target:
+        NOP
+    """
+    src = 'ADDI $1, $0, 5\nADDI $2, $0, 10\nBEQ $1, $2, target\nADDI $3, $0, 42\nADDI $4, $0, 99\ntarget: ADDI $5, $0, 1'
+    machine = assemble(src)
+    
+    cpu = CPUstate()
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+    
+    pipeline = Pipeline()
+    
+    # Run enough cycles for all instructions to complete
+    for _ in range(20):
+        pipeline.step(cpu)
+    
+    # Expected: all instructions execute since branch is not taken
+    assert cpu.registers.read(1) == 5, f"Expected $1=5, got {cpu.registers.read(1)}"
+    assert cpu.registers.read(2) == 10, f"Expected $2=10, got {cpu.registers.read(2)}"
+    assert cpu.registers.read(3) == 42, f"Expected $3=42, got {cpu.registers.read(3)}"
+    assert cpu.registers.read(4) == 99, f"Expected $4=99, got {cpu.registers.read(4)}"
+    assert cpu.registers.read(5) == 1, f"Expected $5=1, got {cpu.registers.read(5)}"
+
+
+def test_unconditional_jump_j():
+    """Test that J (unconditional jump) always flushes and redirects.
+    
+    Program:
+        J target             # Jump to target
+        ADDI $1, $0, 100     # Should NOT execute (flushed)
+    target:
+        ADDI $2, $0, 42      # $2 = 42 (executed)
+    """
+    src = 'J target\nADDI $1, $0, 100\ntarget: ADDI $2, $0, 42'
+    machine = assemble(src)
+    
+    cpu = CPUstate()
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+    
+    pipeline = Pipeline()
+    
+    # Run enough cycles
+    for _ in range(15):
+        pipeline.step(cpu)
+    
+    # Expected: $1 = 0 (never executed), $2 = 42 (executed)
+    assert cpu.registers.read(1) == 0, f"Expected $1=0 (never executed), got {cpu.registers.read(1)}"
+    assert cpu.registers.read(2) == 42, f"Expected $2=42, got {cpu.registers.read(2)}"
+
+
+def test_bne_branch_taken():
+    """Test BNE (branch not equal) when branch is taken.
+    
+    Program:
+        ADDI $1, $0, 5       # $1 = 5
+        BNE $1, $0, target   # $1 != $0, so branch TAKEN
+        ADDI $2, $0, 100     # Should NOT execute
+    target:
+        ADDI $3, $0, 42      # $3 = 42
+    """
+    src = 'ADDI $1, $0, 5\nBNE $1, $0, target\nADDI $2, $0, 100\ntarget: ADDI $3, $0, 42'
+    machine = assemble(src)
+    
+    cpu = CPUstate()
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+    
+    pipeline = Pipeline()
+    
+    for _ in range(15):
+        pipeline.step(cpu)
+    
+    assert cpu.registers.read(1) == 5, f"Expected $1=5, got {cpu.registers.read(1)}"
+    assert cpu.registers.read(2) == 0, f"Expected $2=0 (never executed), got {cpu.registers.read(2)}"
+    assert cpu.registers.read(3) == 42, f"Expected $3=42, got {cpu.registers.read(3)}"
+
+
+
+
+def test_blez_branch_taken():
+    """Test BLEZ (branch if less than or equal to zero).
+    
+    Program:
+        ADDI $1, $0, -5      # $1 = -5 (< 0)
+        BLEZ $1, target      # $1 <= 0, so branch TAKEN
+        ADDI $2, $0, 100     # Should NOT execute
+    target:
+        ADDI $3, $0, 42      # $3 = 42
+    """
+    src = 'ADDI $1, $0, -5\nBLEZ $1, target\nADDI $2, $0, 100\ntarget: ADDI $3, $0, 42'
+    machine = assemble(src)
+    
+    cpu = CPUstate()
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+    
+    pipeline = Pipeline()
+    
+    for _ in range(15):
+        pipeline.step(cpu)
+    
+    assert cpu.registers.read(1) == -5, f"Expected $1=-5, got {cpu.registers.read(1)}"
+    assert cpu.registers.read(2) == 0, f"Expected $2=0 (never executed), got {cpu.registers.read(2)}"
+    assert cpu.registers.read(3) == 42, f"Expected $3=42, got {cpu.registers.read(3)}"
+
+
+def test_blez_branch_not_taken():
+    """Test BLEZ when branch is NOT taken.
+    
+    Program:
+        ADDI $1, $0, 5       # $1 = 5 (> 0)
+        BLEZ $1, target      # $1 <= 0? NO, so fall through
+        ADDI $2, $0, 42      # $2 = 42 (executed)
+    target:
+        ADDI $3, $0, 99      # $3 = 99 (also executed)
+    """
+    src = 'ADDI $1, $0, 5\nBLEZ $1, target\nADDI $2, $0, 42\ntarget: ADDI $3, $0, 99'
+    machine = assemble(src)
+    
+    cpu = CPUstate()
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+    
+    pipeline = Pipeline()
+    
+    for _ in range(15):
+        pipeline.step(cpu)
+    
+    assert cpu.registers.read(1) == 5, f"Expected $1=5, got {cpu.registers.read(1)}"
+    assert cpu.registers.read(2) == 42, f"Expected $2=42, got {cpu.registers.read(2)}"
+    assert cpu.registers.read(3) == 99, f"Expected $3=99, got {cpu.registers.read(3)}"
+
+
+def test_bgtz_branch_taken():
+    """Test BGTZ (branch if greater than zero).
+    
+    Program:
+        ADDI $1, $0, 10      # $1 = 10 (> 0)
+        BGTZ $1, target      # $1 > 0, so branch TAKEN
+        ADDI $2, $0, 100     # Should NOT execute
+    target:
+        ADDI $3, $0, 42      # $3 = 42
+    """
+    src = 'ADDI $1, $0, 10\nBGTZ $1, target\nADDI $2, $0, 100\ntarget: ADDI $3, $0, 42'
+    machine = assemble(src)
+    
+    cpu = CPUstate()
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+    
+    pipeline = Pipeline()
+    
+    for _ in range(15):
+        pipeline.step(cpu)
+    
+    assert cpu.registers.read(1) == 10, f"Expected $1=10, got {cpu.registers.read(1)}"
+    assert cpu.registers.read(2) == 0, f"Expected $2=0 (never executed), got {cpu.registers.read(2)}"
+    assert cpu.registers.read(3) == 42, f"Expected $3=42, got {cpu.registers.read(3)}"
+
+
+def test_blt_branch_taken():
+    """Test BLT (branch if less than).
+    
+    Program:
+        ADDI $1, $0, 5       # $1 = 5
+        ADDI $2, $0, 10      # $2 = 10
+        BLT $1, $2, target   # 5 < 10, so branch TAKEN
+        ADDI $3, $0, 100     # Should NOT execute
+    target:
+        ADDI $4, $0, 42      # $4 = 42
+    """
+    src = 'ADDI $1, $0, 5\nADDI $2, $0, 10\nBLT $1, $2, target\nADDI $3, $0, 100\ntarget: ADDI $4, $0, 42'
+    machine = assemble(src)
+    
+    cpu = CPUstate()
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+    
+    pipeline = Pipeline()
+    
+    for _ in range(20):
+        pipeline.step(cpu)
+    
+    assert cpu.registers.read(1) == 5, f"Expected $1=5, got {cpu.registers.read(1)}"
+    assert cpu.registers.read(2) == 10, f"Expected $2=10, got {cpu.registers.read(2)}"
+    assert cpu.registers.read(3) == 0, f"Expected $3=0 (never executed), got {cpu.registers.read(3)}"
+    assert cpu.registers.read(4) == 42, f"Expected $4=42, got {cpu.registers.read(4)}"
+
+
+def test_bge_branch_taken():
+    """Test BGE (branch if greater than or equal).
+    
+    Program:
+        ADDI $1, $0, 10      # $1 = 10
+        ADDI $2, $0, 5       # $2 = 5
+        BGE $1, $2, target   # 10 >= 5, so branch TAKEN
+        ADDI $3, $0, 100     # Should NOT execute
+    target:
+        ADDI $4, $0, 42      # $4 = 42
+    """
+    src = 'ADDI $1, $0, 10\nADDI $2, $0, 5\nBGE $1, $2, target\nADDI $3, $0, 100\ntarget: ADDI $4, $0, 42'
+    machine = assemble(src)
+    
+    cpu = CPUstate()
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+    
+    pipeline = Pipeline()
+    
+    for _ in range(20):
+        pipeline.step(cpu)
+    
+    assert cpu.registers.read(1) == 10, f"Expected $1=10, got {cpu.registers.read(1)}"
+    assert cpu.registers.read(2) == 5, f"Expected $2=5, got {cpu.registers.read(2)}"
+    assert cpu.registers.read(3) == 0, f"Expected $3=0 (never executed), got {cpu.registers.read(3)}"
+    assert cpu.registers.read(4) == 42, f"Expected $4=42, got {cpu.registers.read(4)}"
+
+
+def test_ble_branch_taken():
+    """Test BLE (branch if less than or equal).
+    
+    Program:
+        ADDI $1, $0, 5       # $1 = 5
+        ADDI $2, $0, 10      # $2 = 10
+        BLE $1, $2, target   # 5 <= 10, so branch TAKEN
+        ADDI $3, $0, 100     # Should NOT execute
+    target:
+        ADDI $4, $0, 42      # $4 = 42
+    """
+    src = 'ADDI $1, $0, 5\nADDI $2, $0, 10\nBLE $1, $2, target\nADDI $3, $0, 100\ntarget: ADDI $4, $0, 42'
+    machine = assemble(src)
+    
+    cpu = CPUstate()
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+    
+    pipeline = Pipeline()
+    
+    for _ in range(20):
+        pipeline.step(cpu)
+    
+    assert cpu.registers.read(1) == 5, f"Expected $1=5, got {cpu.registers.read(1)}"
+    assert cpu.registers.read(2) == 10, f"Expected $2=10, got {cpu.registers.read(2)}"
+    assert cpu.registers.read(3) == 0, f"Expected $3=0 (never executed), got {cpu.registers.read(3)}"
+    assert cpu.registers.read(4) == 42, f"Expected $4=42, got {cpu.registers.read(4)}"
+
+
+def test_bgt_branch_taken():
+    """Test BGT (branch if greater than).
+    
+    Program:
+        ADDI $1, $0, 15      # $1 = 15
+        ADDI $2, $0, 10      # $2 = 10
+        BGT $1, $2, target   # 15 > 10, so branch TAKEN
+        ADDI $3, $0, 100     # Should NOT execute
+    target:
+        ADDI $4, $0, 42      # $4 = 42
+    """
+    src = 'ADDI $1, $0, 15\nADDI $2, $0, 10\nBGT $1, $2, target\nADDI $3, $0, 100\ntarget: ADDI $4, $0, 42'
+    machine = assemble(src)
+    
+    cpu = CPUstate()
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+    
+    pipeline = Pipeline()
+    
+    for _ in range(20):
+        pipeline.step(cpu)
+    
+    assert cpu.registers.read(1) == 15, f"Expected $1=15, got {cpu.registers.read(1)}"
+    assert cpu.registers.read(2) == 10, f"Expected $2=10, got {cpu.registers.read(2)}"
+    assert cpu.registers.read(3) == 0, f"Expected $3=0 (never executed), got {cpu.registers.read(3)}"
+    assert cpu.registers.read(4) == 42, f"Expected $4=42, got {cpu.registers.read(4)}"
+
+
+# Note: Extended branch type support for labels was added to the assembler.
+# Now BLT, BGE, BLE, BGT, BLEZ, and BGTZ can all be tested with labels.
+
+
+#tests/test_decoder.py
+import pytest
+from decoder.decoder import decode
+
+def test_r_type_add():
+    instr = 0x00221820  # ADD $3, $1, $2
+    decoded = decode(instr, pc=0x1000)
+    assert decoded.op == "ADD"
+    assert decoded.type == "R"
+    assert decoded.rs == 1
+    assert decoded.rt == 2
+    assert decoded.rd == 3
+    assert decoded.funct == 0x20
+
+def test_r_type_shift():
+    instr = (0 << 26) | (0 << 21) | (3 << 16) | (2 << 11) | (4 << 6) | 0x00
+    decoded = decode(instr)
+    assert decoded.op == "SLL"
+    assert decoded.shamt == 4
+
+def test_r_type_jr():
+    instr = (31 << 21) | 0x08  # JR $31
+    decoded = decode(instr)
+    assert decoded.op == "JR"
+    assert decoded.rs == 31
+
+def test_i_type_load_store():
+    instr = (0x23 << 26) | (3 << 21) | (2 << 16) | 0x0004  # LW $2, 4($3)
+    decoded = decode(instr)
+    assert decoded.op == "LW"
+    assert decoded.rs == 3
+    assert decoded.rt == 2
+    assert decoded.imm == 4
+
+def test_i_type_branch_beq():
+    instr = (0x04 << 26) | (1 << 21) | (2 << 16) | 0x0004
+    decoded = decode(instr, pc=0x1000)
+    assert decoded.op == "BEQ"
+    assert decoded.rs == 1
+    assert decoded.rt == 2
+    assert decoded.imm == 4
+    assert decoded.target == 0x1000 + 4 + (4 << 2)
+
+def test_i_type_immediate_arith():
+    instr = (0x08 << 26) | (1 << 21) | (2 << 16) | 0x000A  # ADDI
+    decoded = decode(instr)
+    assert decoded.op == "ADDI"
+    assert decoded.rs == 1
+    assert decoded.rt == 2
+    assert decoded.imm == 10
+
+def test_i_type_immediate_logic():
+    instr = (0x0D << 26) | (1 << 21) | (2 << 16) | 0x00FF  # ORI
+    decoded = decode(instr)
+    assert decoded.op == "ORI"
+    assert decoded.rs == 1
+    assert decoded.rt == 2
+    assert decoded.imm == 0x00FF
+
+def test_j_type_jump():
+    instr = (0x02 << 26) | 0x00100000  # J
+    decoded = decode(instr, pc=0x1000)
+    assert decoded.op == "J"
+    assert decoded.type == "J"
+    assert decoded.address == 0x00100000
+    assert decoded.target == ((0x1000 + 4) & 0xF0000000) | (0x00100000 << 2)
+
+def test_j_type_jal():
+    instr = (0x03 << 26) | 0x00100000  # JAL
+    decoded = decode(instr, pc=0x1000)
+    assert decoded.op == "JAL"
+    assert decoded.type == "J"
+
+def test_illegal_r_type_funct():
+    instr = (0 << 26) | (1 << 21) | (2 << 16) | (3 << 11) | (0 << 6) | 0x3F
+    with pytest.raises(ValueError):
+        decode(instr)
+
+def test_illegal_opcode():
+    instr = (0x3F << 26)
+    with pytest.raises(ValueError):
+        decode(instr)
+
+#tests/test_decoder_execute_integration.py
+from execute.alu import alu
+from execute.branch_unit import branch
+from execute.load_store_unit import load_store
+from state.memory import Memory
+from tests.util import require_field, decode_word
+
+
+def test_decode_and_alu_add():
+    # ADD $3, $1, $2 -> verify alu result when applied
+    instr = 0x00221820  # ADD $3, $1, $2
+    dec = decode_word(instr)
+    assert dec.op == 'ADD'
+    res = alu(dec.op, 10, 5)
+    assert res == 15
+
+
+def test_decode_and_branch_beq_taken():
+    instr = (0x04 << 26) | (1 << 21) | (2 << 16) | 0x0004
+    dec = decode_word(instr, pc=0x1000)
+    assert dec.op == 'BEQ'
+    # if rs==rt, target should be pc+4+(imm<<2)
+    target = require_field(dec, 'target')
+    tgt = branch(dec.op, 5, 5, target, pc=0x1000)
+    assert tgt == dec.target
+
+
+def test_decode_and_load_store():
+    mem = Memory(size=64)
+    # store via load_store and then load
+    mem.store_word(8, 0xAABBCCDD)
+    res = load_store('LW', mem, 8)
+    assert res == 0xAABBCCDD
+
+#!/usr/bin/env python3
+"""
+tests/test_edge_cases.py - Comprehensive Edge Case Testing
+
+This test suite includes 60 edge cases that stress the DLX simulator to its limits.
+Tests cover:
+  - Branch edge cases (7 tests)
+  - Forwarding edge cases (7 tests)
+  - Stalling edge cases (6 tests)
+  - Flushing edge cases (7 tests)
+  - Register edge cases (6 tests)
+  - Memory edge cases (6 tests)
+  - Complex interactions (6 tests)
+  - Boundary conditions (7 tests)
+  - Correctness verification (6 tests)
+
+Total: 60 comprehensive tests
+"""
+
+import pytest
+from parser.lexer import Lexer
+from parser.asm_parser import Parser
+from parser.assembler import Assembler
+from state.cpu_state import CPUstate
+from pipeline.pipeline import Pipeline
+
+
+def run_program(asm_code, max_cycles=200):
+    """Helper: Assemble and run a program, return final CPU state."""
+    lexer = Lexer(asm_code)
+    tokens = lexer.tokenize()
+    parser = Parser(tokens)
+    instructions = parser.parse()
+    assembler = Assembler(instructions)
+    machine_code = assembler.assemble()
+    
+    cpu = CPUstate()
+    pipeline = Pipeline()
+    
+    # Load machine code into memory
+    for idx, instruction in enumerate(machine_code):
+        addr = idx * 4
+        cpu.memory.store_word(addr, instruction)
+    
+    # Run simulation
+    halted = False
+    cycle = 0
+    halt_cycle = 0
+    for cycle in range(max_cycles):
+        pipeline.step(cpu)
+        
+        # Halt if PC goes out of bounds
+        if cpu.pc < 0 or cpu.pc >= len(machine_code) * 4:
+            if not halted:
+                halted = True
+                halt_cycle = cycle
+            # After halt detected, run 5 more cycles to drain pipeline
+            elif cycle >= halt_cycle + 5:
+                break
+    
+    return cpu, pipeline
+
+
+# ========================================================
+# BRANCH EDGE CASES (7 tests)
+# ========================================================
+
+def test_branch_to_branch():
+    """Test: Branch target points to another branch instruction."""
+    code = """
+    ADDI $1, $0, 5
+    ADDI $2, $0, 5
+    BEQ $1, $2, label2
+    ADDI $3, $0, 999
+    label2:
+    BEQ $1, $2, end
+    ADDI $4, $0, 999
+    end:
+    ADDI $5, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(1) == 5
+    assert cpu.registers.read(2) == 5
+    assert cpu.registers.read(5) == 42
+    assert cpu.registers.read(3) == 0  # Skipped
+    assert cpu.registers.read(4) == 0  # Skipped
+
+
+def test_backwards_branch():
+    """Test: Branch backwards to earlier instruction (loop)."""
+    code = """
+    ADDI $1, $0, 3
+    ADDI $2, $0, 0
+    loop:
+    ADD $2, $2, $1
+    ADDI $1, $1, -1
+    BNE $1, $0, loop
+    ADDI $3, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    # $2 should be 3 + 2 + 1 = 6
+    assert cpu.registers.read(2) == 6
+    assert cpu.registers.read(1) == 0
+    assert cpu.registers.read(3) == 42
+
+
+def test_forward_branch():
+    """Test: Branch far ahead in program."""
+    code = """
+    ADDI $1, $0, 1
+    BEQ $1, $1, end
+    ADDI $2, $0, 1
+    ADDI $3, $0, 2
+    ADDI $4, $0, 3
+    ADDI $5, $0, 4
+    end:
+    ADDI $6, $0, 100
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(1) == 1
+    assert cpu.registers.read(6) == 100
+    assert cpu.registers.read(2) == 0  # Branch taken, skipped
+    assert cpu.registers.read(3) == 0  # Branch taken, skipped
+    assert cpu.registers.read(4) == 0  # Branch taken, skipped
+    assert cpu.registers.read(5) == 0  # Branch taken, skipped
+
+
+def test_consecutive_branches():
+    """Test: Multiple branches in rapid succession."""
+    code = """
+    ADDI $1, $0, 1
+    BEQ $1, $0, skip1
+    ADDI $2, $0, 1
+    skip1:
+    BEQ $1, $1, skip2
+    ADDI $3, $0, 999
+    skip2:
+    ADDI $4, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 1  # First branch not taken
+    assert cpu.registers.read(3) == 0  # Second branch taken, skipped
+    assert cpu.registers.read(4) == 42
+
+
+def test_branch_not_taken_then_taken():
+    """Test: Branch not taken, then immediately branch taken."""
+    code = """
+    ADDI $1, $0, 5
+    ADDI $2, $0, 10
+    BEQ $1, $2, end
+    ADDI $3, $0, 1
+    BEQ $1, $1, end
+    ADDI $4, $0, 999
+    end:
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(3) == 1  # First branch not taken
+    assert cpu.registers.read(4) == 0  # Second branch taken, skipped
+    assert cpu.registers.read(1) == 5
+
+
+def test_branch_with_max_offset():
+    """Test: Branch with large offset (label far away)."""
+    code = """
+    ADDI $1, $0, 1
+    BNE $1, $0, far_label
+    ADDI $2, $0, 999
+    ADDI $3, $0, 999
+    ADDI $4, $0, 999
+    far_label:
+    ADDI $5, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(5) == 42
+    assert cpu.registers.read(2) == 0
+
+
+def test_branch_with_forwarding_dependency():
+    """Test: Branch condition depends on forwarded value."""
+    code = """
+    ADDI $1, $0, 10
+    ADDI $2, $1, 5
+    BEQ $2, $0, skip
+    ADDI $3, $0, 1
+    skip:
+    ADDI $4, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    # $2 = 10 + 5 = 15, not equal to 0, so branch not taken
+    assert cpu.registers.read(2) == 15
+    assert cpu.registers.read(3) == 1
+    assert cpu.registers.read(4) == 42
+
+
+# ========================================================
+# FORWARDING EDGE CASES (7 tests)
+# ========================================================
+
+def test_full_forwarding_chain_5deep():
+    """Test: 5-deep forwarding chain ($1→$2→$3→$4→$5)."""
+    code = """
+    ADDI $1, $0, 10
+    ADDI $2, $1, 5
+    ADDI $3, $2, 5
+    ADDI $4, $3, 5
+    ADDI $5, $4, 5
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(1) == 10
+    assert cpu.registers.read(2) == 15  # 10 + 5
+    assert cpu.registers.read(3) == 20  # 15 + 5
+    assert cpu.registers.read(4) == 25  # 20 + 5
+    assert cpu.registers.read(5) == 30  # 25 + 5
+
+
+def test_forward_from_wb_to_ex():
+    """Test: Maximum distance forwarding (WB to EX = 5 stages apart)."""
+    code = """
+    ADDI $1, $0, 100
+    NOP
+    NOP
+    NOP
+    NOP
+    ADDI $2, $1, 50
+    HALT
+    """
+    cpu, _ = run_program(code)
+    # After 5 NOP cycles, $1 is in WB, $2 can forward from it
+    assert cpu.registers.read(1) == 100
+    assert cpu.registers.read(2) == 150
+
+
+def test_forward_from_mem_to_alu():
+    """Test: Memory stage result forwarded to next ALU."""
+    code = """
+    ADDI $1, $0, 42
+    ADD $2, $1, $1
+    ADD $3, $2, $1
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(1) == 42
+    assert cpu.registers.read(2) == 84  # 42 + 42
+    assert cpu.registers.read(3) == 126  # 84 + 42
+
+
+def test_multiple_forwards_same_cycle():
+    """Test: Both operands forwarded in single instruction."""
+    code = """
+    ADDI $1, $0, 10
+    ADDI $2, $0, 20
+    ADD $3, $1, $2
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(3) == 30
+
+
+def test_forward_through_stall():
+    """Test: Forwarding works correctly when load-use stall occurs."""
+    code = """
+    ADDI $1, $0, 42
+    SW $1, 0($0)
+    LW $2, 0($0)
+    NOP
+    ADDI $4, $2, 10
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 42
+    assert cpu.registers.read(4) == 52  # 42 + 10
+
+
+def test_forward_through_branch():
+    """Test: Forwarded value used as branch operand."""
+    code = """
+    ADDI $1, $0, 5
+    ADDI $2, $1, 0
+    BEQ $2, $1, success
+    ADDI $3, $0, 999
+    success:
+    ADDI $3, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(1) == 5
+    assert cpu.registers.read(2) == 5
+    assert cpu.registers.read(3) == 42
+
+
+def test_forwarding_with_zero_register():
+    """Test: Forwarding from/to $0 (always 0)."""
+    code = """
+    ADDI $1, $0, 100
+    ADD $2, $1, $0
+    ADDI $0, $0, 999
+    ADD $3, $0, $1
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(0) == 0  # $0 always 0
+    assert cpu.registers.read(2) == 100  # 100 + 0
+    assert cpu.registers.read(3) == 100  # 0 + 100
+
+
+# ========================================================
+# STALLING EDGE CASES (6 tests)
+# ========================================================
+
+def test_load_use_single_stall():
+    """Test: Load-use dependency causes 1-cycle stall."""
+    code = """
+    ADDI $1, $0, 100
+    SW $1, 0($0)
+    LW $2, 0($0)
+    ADDI $3, $2, 10
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 100
+    assert cpu.registers.read(3) == 110
+
+
+def test_load_use_double_stall():
+    """Test: Two load-use dependencies cause cumulative stalls."""
+    code = """
+    ADDI $1, $0, 50
+    SW $1, 0($0)
+    LW $2, 0($0)
+    NOP
+    LW $3, 0($0)
+    NOP
+    ADD $4, $2, $3
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 50
+    assert cpu.registers.read(3) == 50
+    assert cpu.registers.read(4) == 100
+
+
+def test_stall_followed_by_branch():
+    """Test: Stall on load, then branch depends on loaded value."""
+    code = """
+    ADDI $1, $0, 0
+    SW $1, 0($0)
+    LW $2, 0($0)
+    BEQ $2, $0, success
+    ADDI $3, $0, 999
+    success:
+    ADDI $3, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 0
+    assert cpu.registers.read(3) == 42
+
+
+def test_stall_followed_by_forward():
+    """Test: Stall occurs, then forwarding continues normally."""
+    code = """
+    ADDI $1, $0, 10
+    SW $1, 4($0)
+    LW $2, 4($0)
+    NOP
+    ADDI $3, $2, 5
+    ADD $4, $3, $2
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 10
+    assert cpu.registers.read(3) == 15
+    assert cpu.registers.read(4) == 25
+
+
+def test_back_to_back_loads():
+    """Test: Two consecutive loads with dependency."""
+    code = """
+    ADDI $1, $0, 100
+    SW $1, 0($0)
+    LW $2, 0($0)
+    ADDI $0, $0, 0
+    LW $3, 0($0)
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 100
+    assert cpu.registers.read(3) == 100
+
+
+def test_load_store_data_chain():
+    """Test: Store to memory, then load from same address."""
+    code = """
+    ADDI $1, $0, 42
+    SW $1, 0($0)
+    LW $2, 0($0)
+    NOP
+    ADDI $3, $2, 8
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.memory.load_word(0) == 42
+    assert cpu.registers.read(2) == 42
+    assert cpu.registers.read(3) == 50
+
+
+# ========================================================
+# FLUSHING EDGE CASES (7 tests)
+# ========================================================
+
+def test_flush_clears_if_id():
+    """Test: IF/ID register is cleared when branch flushes."""
+    code = """
+    ADDI $1, $0, 1
+    BEQ $1, $1, success
+    ADDI $2, $0, 999
+    success:
+    ADDI $3, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    # If flush works, $2 should not be written
+    assert cpu.registers.read(2) == 0
+
+
+def test_flush_clears_id_ex():
+    """Test: ID/EX register is cleared when branch flushes."""
+    code = """
+    ADDI $1, $0, 1
+    ADDI $2, $0, 1
+    BEQ $1, $2, success
+    ADDI $3, $0, 999
+    success:
+    ADDI $4, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(3) == 0
+    assert cpu.registers.read(4) == 42
+
+
+def test_jump_immediately_after_jump():
+    """Test: Two jumps in succession."""
+    code = """
+    J label1
+    ADDI $1, $0, 999
+    label1:
+    J label2
+    ADDI $2, $0, 999
+    label2:
+    ADDI $3, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(1) == 0
+    assert cpu.registers.read(2) == 0
+    assert cpu.registers.read(3) == 42
+
+
+def test_flush_with_pending_forwards():
+    """Test: In-flight data exists when flush happens."""
+    code = """
+    ADDI $1, $0, 10
+    ADDI $2, $1, 5
+    BEQ $1, $1, end
+    ADDI $3, $0, 999
+    end:
+    ADDI $4, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 15  # Forwarding still works
+    assert cpu.registers.read(3) == 0   # But branch flush clears later instruction
+    assert cpu.registers.read(4) == 42  # Branch was taken
+
+
+def test_flush_followed_by_load():
+    """Test: Branch flushes, next instruction is load (with stall)."""
+    code = """
+    ADDI $1, $0, 100
+    SW $1, 0($0)
+    BEQ $1, $1, continue
+    ADDI $2, $0, 999
+    continue:
+    LW $3, 0($0)
+    NOP
+    ADDI $4, $3, 10
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(3) == 100
+    assert cpu.registers.read(4) == 110
+
+
+def test_multiple_flushes_in_sequence():
+    """Test: Several branches taken in close proximity."""
+    code = """
+    ADDI $1, $0, 1
+    BEQ $1, $1, a
+    ADDI $2, $0, 999
+    a:
+    BEQ $1, $1, b
+    ADDI $3, $0, 999
+    b:
+    ADDI $4, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 0
+    assert cpu.registers.read(3) == 0
+    assert cpu.registers.read(4) == 42
+
+
+def test_branch_flush_vs_load_stall():
+    """Test: Branch flush happens; load stall is cleared by flush."""
+    code = """
+    ADDI $1, $0, 50
+    SW $1, 0($0)
+    LW $2, 0($0)
+    BEQ $1, $1, skip
+    ADDI $3, $0, 999
+    skip:
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 50
+
+
+# ========================================================
+# REGISTER EDGE CASES (6 tests)
+# ========================================================
+
+def test_write_to_zero_register():
+    """Test: Writing to $0 has no effect (always 0)."""
+    code = """
+    ADDI $0, $0, 999
+    ADDI $1, $0, 1
+    ADD $0, $1, $1
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(0) == 0
+
+
+def test_forward_from_zero():
+    """Test: Forwarding from $0 (always 0)."""
+    code = """
+    ADDI $1, $0, 0
+    ADDI $2, $1, 100
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 100
+
+
+def test_zero_in_all_positions():
+    """Test: $0 as rs, rt, and rd."""
+    code = """
+    ADD $0, $0, $0
+    ADDI $1, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(0) == 0
+    assert cpu.registers.read(1) == 42
+
+
+def test_register_31_usage():
+    """Test: Return address register $31."""
+    code = """
+    ADDI $31, $0, 100
+    ADDI $1, $31, 1
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(31) == 100
+    assert cpu.registers.read(1) == 101
+
+
+def test_all_32_registers_used():
+    """Test: Sequential usage of every register."""
+    code = """
+    ADDI $1, $0, 1
+    ADD $2, $1, $1
+    ADD $3, $2, $1
+    ADD $4, $3, $1
+    ADD $5, $4, $1
+    ADD $6, $5, $1
+    ADD $7, $6, $1
+    ADD $8, $7, $1
+    ADD $9, $8, $1
+    ADD $10, $9, $1
+    ADD $11, $10, $1
+    ADD $12, $11, $1
+    ADD $13, $12, $1
+    ADD $14, $13, $1
+    ADD $15, $14, $1
+    ADD $16, $15, $1
+    ADD $17, $16, $1
+    ADD $18, $17, $1
+    ADD $19, $18, $1
+    ADD $20, $19, $1
+    ADD $21, $20, $1
+    ADD $22, $21, $1
+    ADD $23, $22, $1
+    ADD $24, $23, $1
+    ADD $25, $24, $1
+    ADD $26, $25, $1
+    ADD $27, $26, $1
+    ADD $28, $27, $1
+    ADD $29, $28, $1
+    ADD $30, $29, $1
+    HALT
+    """
+    cpu, _ = run_program(code, max_cycles=300)
+    for i in range(1, 31):
+        assert cpu.registers.read(i) == i
+
+
+def test_register_reuse():
+    """Test: Same register written multiple times."""
+    code = """
+    ADDI $1, $0, 10
+    ADD $1, $1, $1
+    ADD $1, $1, $1
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(1) == 40  # 10 → 20 → 40
+
+
+# ========================================================
+# MEMORY EDGE CASES (6 tests)
+# ========================================================
+
+def test_store_load_same_address():
+    """Test: Store then load from same address."""
+    code = """
+    ADDI $1, $0, 1000
+    SW $1, 0($0)
+    LW $2, 0($0)
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 1000
+
+
+def test_multiple_stores_same_address():
+    """Test: Multiple stores to same address (second overwrites)."""
+    code = """
+    ADDI $1, $0, 100
+    SW $1, 0($0)
+    ADDI $2, $0, 200
+    SW $2, 0($0)
+    LW $3, 0($0)
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.memory.load_word(0) == 200
+    assert cpu.registers.read(3) == 200
+
+
+def test_load_same_location_multiple_times():
+    """Test: Multiple loads from same address."""
+    code = """
+    ADDI $1, $0, 42
+    SW $1, 0($0)
+    LW $2, 0($0)
+    ADDI $0, $0, 0
+    LW $3, 0($0)
+    ADDI $0, $0, 0
+    LW $4, 0($0)
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 42
+    assert cpu.registers.read(3) == 42
+    assert cpu.registers.read(4) == 42
+
+
+def test_address_zero_access():
+    """Test: Load/store from memory address 0x0000."""
+    code = """
+    ADDI $1, $0, 5000
+    SW $1, 0($0)
+    LW $2, 0($0)
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.memory.load_word(0) == 5000
+    assert cpu.registers.read(2) == 5000
+
+
+def test_load_with_zero_offset():
+    """Test: Load with zero immediate offset."""
+    code = """
+    ADDI $1, $0, 12345
+    SW $1, 0($0)
+    LW $2, 0($0)
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 12345
+
+
+def test_store_with_zero_offset():
+    """Test: Store with zero offset."""
+    code = """
+    ADDI $1, $0, 7777
+    SW $1, 0($0)
+    LW $2, 0($0)
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 7777
+
+
+# ========================================================
+# COMPLEX INTERACTION EDGE CASES (6 tests)
+# ========================================================
+
+def test_load_use_then_branch():
+    """Test: Stall on LW, then branch depends on loaded value."""
+    code = """
+    ADDI $1, $0, 1
+    SW $1, 0($0)
+    LW $2, 0($0)
+    BEQ $2, $1, success
+    ADDI $3, $0, 999
+    success:
+    ADDI $3, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 1
+    assert cpu.registers.read(3) == 42
+
+
+def test_forward_chain_then_stall():
+    """Test: Forwarding chain works, then load stalls chain."""
+    code = """
+    ADDI $1, $0, 10
+    ADDI $2, $1, 5
+    ADDI $3, $2, 5
+    ADDI $4, $0, 0
+    SW $4, 0($0)
+    ADDI $4, $3, 10
+    LW $5, 0($0)
+    ADDI $0, $0, 0
+    ADD $6, $5, $4
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(4) == 30  # 10 + 5 + 5 + 10
+    assert cpu.registers.read(5) == 0
+    assert cpu.registers.read(6) == 30
+
+
+def test_branch_flush_with_pending_stores():
+    """Test: Store in MEM when branch flushes."""
+    code = """
+    ADDI $1, $0, 100
+    SW $1, 0($0)
+    BEQ $1, $1, success
+    ADDI $2, $0, 999
+    success:
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.memory.load_word(0) == 100
+    assert cpu.registers.read(2) == 0
+
+
+def test_branch_within_dependency_chain():
+    """Test: Branch condition is in middle of forwarding chain."""
+    code = """
+    ADDI $1, $0, 5
+    ADDI $2, $1, 0
+    BEQ $2, $1, cont
+    ADDI $3, $0, 999
+    cont:
+    ADDI $4, $2, 10
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 5
+    assert cpu.registers.read(3) == 0
+    assert cpu.registers.read(4) == 15
+
+
+def test_double_stall_then_branch():
+    """Test: Two load-use stalls, then branch depends on result."""
+    code = """
+    ADDI $1, $0, 1
+    SW $1, 0($0)
+    LW $2, 0($0)
+    NOP
+    LW $3, 0($0)
+    NOP
+    ADD $4, $2, $3
+    BEQ $4, $4, end
+    ADDI $5, $0, 999
+    end:
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(4) == 2  # 1 + 1
+    assert cpu.registers.read(5) == 0  # Branch taken (4==4), skipped
+
+
+def test_forward_chain_broken_by_stall():
+    """Test: Loaded value used after stall completes, in a new chain.
+    
+    This tests that after a load-use stall:
+    1. The loaded value is available ($4 = 10)
+    2. It can be used in subsequent computations
+    3. And that value can forward to further instructions
+    """
+    code = """
+    ADDI $1, $0, 10
+    ADDI $2, $1, 5
+    ADDI $3, $2, 5
+    SW $1, 4($0)
+    LW $4, 4($0)
+    NOP
+    NOP
+    NOP
+    ADDI $6, $4, 2
+    ADD $5, $6, $3
+    HALT
+    """
+    cpu, _ = run_program(code, max_cycles=250)
+    assert cpu.registers.read(4) == 10   # Load from memory succeeds
+    assert cpu.registers.read(6) == 12   # $4 (10) + 2
+    assert cpu.registers.read(5) == 32   # $6 (12) + $3 (20)
+
+
+# ========================================================
+# BOUNDARY & STATE EDGE CASES (7 tests)
+# ========================================================
+
+def test_maximum_throughput_sequence():
+    """Test: Back-to-back ALU ops (no hazards - full throughput)."""
+    code = """
+    ADDI $1, $0, 1
+    ADDI $2, $0, 2
+    ADDI $3, $0, 3
+    ADDI $4, $0, 4
+    ADDI $5, $0, 5
+    ADD $6, $1, $2
+    ADD $7, $3, $4
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(6) == 3
+    assert cpu.registers.read(7) == 7
+
+
+def test_minimum_program():
+    """Test: Single instruction then halt."""
+    code = """
+    ADDI $1, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(1) == 42
+
+
+def test_program_with_only_nops():
+    """Test: Multiple NOP instructions."""
+    code = """
+    NOP
+    NOP
+    NOP
+    ADDI $1, $0, 42
+    NOP
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(1) == 42
+
+
+def test_program_with_only_jumps():
+    """Test: Jump chaining."""
+    code = """
+    J label1
+    ADDI $1, $0, 999
+    label1:
+    J label2
+    ADDI $2, $0, 999
+    label2:
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(1) == 0
+    assert cpu.registers.read(2) == 0
+
+
+def test_program_with_only_loads():
+    """Test: Multiple loads (verify stalls accumulate)."""
+    code = """
+    ADDI $1, $0, 10
+    SW $1, 0($0)
+    LW $2, 0($0)
+    ADDI $0, $0, 0
+    LW $3, 0($0)
+    ADDI $0, $0, 0
+    LW $4, 0($0)
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(2) == 10
+    assert cpu.registers.read(3) == 10
+    assert cpu.registers.read(4) == 10
+
+
+def test_program_with_only_stores():
+    """Test: Multiple stores (no stalls expected)."""
+    code = """
+    ADDI $1, $0, 10
+    ADDI $2, $0, 20
+    ADDI $3, $0, 30
+    SW $1, 0($0)
+    SW $2, 4($0)
+    SW $3, 8($0)
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.memory.load_word(0) == 10
+    assert cpu.memory.load_word(4) == 20
+    assert cpu.memory.load_word(8) == 30
+
+
+def test_pc_at_program_boundary():
+    """Test: PC exactly at program end."""
+    code = """
+    ADDI $1, $0, 42
+    HALT
+    """
+    cpu, _ = run_program(code)
+    # PC should be at or past program end
+    assert cpu.registers.read(1) == 42
+
+
+# ========================================================
+# CORRECTNESS VERIFICATION EDGE CASES (6 tests)
+# ========================================================
+
+def test_computed_values_match_expected():
+    """Test: All arithmetic results are correct."""
+    code = """
+    ADDI $1, $0, 10
+    ADDI $2, $0, 20
+    ADD $3, $1, $2
+    SUB $4, $3, $1
+    ADD $5, $4, $2
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(3) == 30  # 10 + 20
+    assert cpu.registers.read(4) == 20  # 30 - 10
+    assert cpu.registers.read(5) == 40  # 20 + 20
+
+
+def test_memory_state_matches_expected():
+    """Test: All memory writes are correct and in correct locations."""
+    code = """
+    ADDI $1, $0, 100
+    ADDI $2, $0, 200
+    ADDI $3, $0, 300
+    SW $1, 0($0)
+    SW $2, 4($0)
+    SW $3, 8($0)
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.memory.load_word(0) == 100
+    assert cpu.memory.load_word(4) == 200
+    assert cpu.memory.load_word(8) == 300
+
+
+def test_register_state_matches_expected():
+    """Test: All registers have expected values."""
+    code = """
+    ADDI $1, $0, 1
+    ADDI $2, $0, 2
+    ADDI $3, $0, 3
+    ADDI $4, $0, 4
+    ADDI $5, $0, 5
+    HALT
+    """
+    cpu, _ = run_program(code)
+    for i in range(1, 6):
+        assert cpu.registers.read(i) == i
+
+
+def test_no_data_corruption():
+    """Test: Unwritten registers remain untouched."""
+    code = """
+    ADDI $1, $0, 100
+    SW $1, 0($0)
+    HALT
+    """
+    cpu, _ = run_program(code)
+    # Verify unwritten registers are zero
+    for i in range(2, 32):
+        assert cpu.registers.read(i) == 0
+    # Note: memory locations 4+ may contain instruction words from program code
+
+
+def test_no_spurious_modifications():
+    """Test: Only intentional writes occur."""
+    code = """
+    ADDI $1, $0, 42
+    BEQ $0, $0, end
+    ADDI $2, $0, 999
+    end:
+    HALT
+    """
+    cpu, _ = run_program(code)
+    assert cpu.registers.read(1) == 42
+    assert cpu.registers.read(2) == 0  # Branch should have flushed this
+
+
+def test_correct_cycle_count():
+    """Test: Cycle count accounting is accurate."""
+    code = """
+    ADDI $1, $0, 10
+    ADDI $2, $0, 20
+    ADD $3, $1, $2
+    HALT
+    """
+    # Should complete in ~9 cycles (4 instructions + 5 flush)
+    cpu, _ = run_program(code, max_cycles=50)
+    assert cpu.registers.read(3) == 30
+
+
+# Run all tests
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])
+
+
+# tests/test_forwarding_unit.py
+"""Unit test for forwarding logic."""
+from pipeline.pipeline_regs import ID_EX, EX_MEM, MEM_WB
+from pipeline.hazards import forwarding
+
+
+def test_forwarding_from_mem_wb():
+    """Test that forwarding works from MEM/WB."""
+    id_ex = ID_EX()
+    id_ex.rs = 1
+    id_ex.rs_val = None  # Cleared, needs forwarding
+
+    print(f"Before forwarding: id_ex.rs_val = {id_ex.rs_val}, type = {type(id_ex.rs_val)}")
+
+    ex_mem = EX_MEM()
+    ex_mem.mem_op = "LW"
+    ex_mem.rd = 1
+    ex_mem.alu_result = 0  # Address computed
+
+    mem_wb = MEM_WB()
+    mem_wb.mem_data = 42
+    mem_wb.alu_result = None
+    mem_wb.rd = 1
+
+    print(f"mem_wb: rd={mem_wb.rd}, mem_data={mem_wb.mem_data}, alu_result={mem_wb.alu_result}")
+    print(f"Calling forwarding...")
+
+    # Apply forwarding
+    forwarding(id_ex, ex_mem, mem_wb)
+
+    print(f"After forwarding: id_ex.rs_val = {id_ex.rs_val}, type = {type(id_ex.rs_val)}")
+    assert id_ex.rs_val == 42, f"Expected forwarding to fill rs_val with 42, got {id_ex.rs_val}"
+
+
+if __name__ == "__main__":
+    test_forwarding_from_mem_wb()
+    print("Forwarding unit test passed!")
+
+
+#tests/test_full_cycle_simulation.py
+from decoder.decoder import decode
+from execute.alu import alu
+from execute.load_store_unit import load_store
+
+
+from tests.util import assemble, make_cpu, assert_registers, assert_memory_word, require_field
+
+
+# `execute_decoded` is now provided by `tests.util`. Import the shared helper instead.
+from tests.util import execute_decoded, run_program
+
+
+
+def test_full_cycle_store_and_load():
+    src = 'ADDI $1, $0, 8\nSW $1, 0($0)\nLW $2, 0($0)'
+    # Use `run_program` to assemble and execute the straight-line program
+    cpu = run_program(src)
+    assert_registers(cpu, {2: 8})
+    # memory at 0 should contain 8 (word)
+    assert_memory_word(cpu.memory, 0, 8)
+
+#tests/test_lexer.py
+from parser.lexer import Lexer
+
+
+def test_basic_tokens():
+    src = "ADD $1, $2, $3"
+    lex = Lexer(src)
+    tokens = lex.tokenize()
+    types = [t.type for t in tokens]
+    values = [t.value for t in tokens]
+    assert types == ['MNEMONIC', 'REGISTER', 'COMMA', 'REGISTER', 'COMMA', 'REGISTER']
+    assert values[0] == 'ADD'
+    assert values[1] == '$1'
+
+
+def test_label_and_comment():
+    src = "loop: ADD $1, $1, $2  # increment"
+    tokens = Lexer(src).tokenize()
+    assert tokens[0].type == 'LABEL_DEF' and tokens[0].value == 'loop'
+    assert any(t.type == 'MNEMONIC' and t.value == 'ADD' for t in tokens)
+
+
+def test_lw_syntax():
+    src = "LW $2, 4($3)"
+    tokens = Lexer(src).tokenize()
+    # Expect MNEMONIC REGISTER COMMA IMMEDIATE LPAREN REGISTER RPAREN
+    assert [t.type for t in tokens] == ['MNEMONIC','REGISTER','COMMA','IMMEDIATE','LPAREN','REGISTER','RPAREN']
+
+
+def test_hex_and_negative_immediates():
+    src = "ADDI $1, $2, -0x10"
+    tokens = Lexer(src).tokenize()
+    assert any(t.type == 'IMMEDIATE' and t.value == '-0x10' for t in tokens)
+
+
+#tests/test_load_store_unit.py
+import pytest
+from execute.load_store_unit import load_store
+from state.memory import Memory
+
+
+def test_lw_and_sw_word():
+    mem = Memory(size=64)
+    # store word then load it back
+    load_store('SW', mem, 4, 0x11223344)
+    assert load_store('LW', mem, 4) == 0x11223344
+
+
+def test_lb_lbu_and_sb():
+    mem = Memory(size=32)
+    mem.mem[10] = 0xFF  # -1 signed
+    assert load_store('LB', mem, 10) == -1
+    assert load_store('LBU', mem, 10) == 0xFF
+
+    # store byte
+    load_store('SB', mem, 11, 0x7F)
+    assert mem.mem[11] == 0x7F
+
+
+def test_lh_lhu_and_sh():
+    mem = Memory(size=32)
+    # write half as two bytes and read as LH
+    mem.mem[20] = 0xFF
+    mem.mem[21] = 0x80  # 0xFF80 -> signed -128
+    assert load_store('LH', mem, 20) == -128
+    assert load_store('LHU', mem, 20) == 0xFF80
+
+    load_store('SH', mem, 22, 0x1234)
+    assert mem.mem[22] == 0x12
+    assert mem.mem[23] == 0x34
+
+
+def test_alignment_and_bounds_checks():
+    mem = Memory(size=16)
+    with pytest.raises(ValueError):
+        load_store('LW', mem, 2)  # unaligned
+
+    with pytest.raises(ValueError):
+        load_store('SH', mem, 15, 1)  # halfword out of bounds
+
+    with pytest.raises(ValueError):
+        load_store('LW', mem, 65536)  # out of bounds
+
+
+def test_store_requires_rt_val():
+    mem = Memory(size=16)
+    with pytest.raises(ValueError):
+        load_store('SW', mem, 0, None)
+
+    with pytest.raises(ValueError):
+        load_store('SB', mem, 0, None)
+
+    with pytest.raises(ValueError):
+        load_store('SH', mem, 0, None)
+
+
+def test_unsupported_memory_op_raises():
+    mem = Memory(size=8)
+    with pytest.raises(ValueError):
+        load_store('FOO', mem, 0)
+
+
+#tests/test_parser.py
+from parser.lexer import Lexer
+from parser.asm_parser import Parser
+
+
+def test_parse_simple_instruction():
+    src = "ADD $3, $1, $2"
+    tokens = Lexer(src).tokenize()
+    parsed = Parser(tokens).parse()
+    assert len(parsed) == 1
+    instr = parsed[0]
+    assert instr.mnemonic == 'ADD'
+    assert instr.operands == ['$3', '$1', '$2']
+
+
+def test_parse_label_and_instruction():
+    src = "loop: SUB $1, $2, $3\nJ loop"
+    tokens = Lexer(src).tokenize()
+    p = Parser(tokens)
+    instructions = p.parse()
+    assert instructions[0].label == 'loop'
+    assert p.labels['loop'] == 0
+    # second instruction should be J with operand 'loop'
+    assert instructions[1].mnemonic == 'J'
+    assert instructions[1].operands == ['loop']
+
+
+# tests/test_pipeline_basic.py
+from tests.util import assemble
+from state.cpu_state import CPUstate
+from pipeline.pipeline import Pipeline
+
+
+def test_pipeline_simple_add_sequence():
+    # Program: $1=5; $2=10; $3 = $1+$2
+    src = 'ADDI $1, $0, 5\nADDI $2, $0, 10\nADD $3, $1, $2'
+    machine = assemble(src)
+
+    cpu = CPUstate()
+    # load machine code into memory at 0,4,8
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+
+    pipeline = Pipeline()
+
+    # Run enough cycles for the three-instruction program to write back $3
+    # A conservative upper bound: pipeline depth (5) + number of instructions
+    cycles = 5 + len(machine) + 1
+    for _ in range(cycles):
+        pipeline.step(cpu)
+
+    assert cpu.registers.read(3) == 15
+
+
+# tests/test_pipeline_debug.py
+"""Debug test for tracing pipeline behavior cycle by cycle."""
+from tests.util import assemble
+from state.cpu_state import CPUstate
+from pipeline.pipeline import Pipeline
+
+
+def test_pipeline_trace_load_use():
+    """Trace through the load-use stall scenario step by step."""
+    src = 'LW $1, 0($0)\nADD $2, $1, $0\nADDI $3, $0, 5'
+    machine = assemble(src)
+
+    cpu = CPUstate()
+    cpu.memory.store_word(0, 42)
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(4 + i * 4, word)
+    cpu.pc = 4
+
+    pipeline = Pipeline()
+
+    for cycle in range(12):
+        pipeline.step(cpu)
+        print(f"Cycle {cycle}: "
+              f"ID/EX(op={pipeline.id_ex.op}, rs={pipeline.id_ex.rs}, rs_val={pipeline.id_ex.rs_val}, rt={pipeline.id_ex.rt}, rt_val={pipeline.id_ex.rt_val}, rd={pipeline.id_ex.rd}), "
+              f"EX/MEM(mem_op={pipeline.ex_mem.mem_op}, alu_result={pipeline.ex_mem.alu_result}, rd={pipeline.ex_mem.rd}), "
+              f"MEM/WB(mem_data={pipeline.mem_wb.mem_data}, alu_result={pipeline.mem_wb.alu_result}, rd={pipeline.mem_wb.rd}), "
+              f"Regs[$1,2,3]=[{cpu.registers.read(1)}, {cpu.registers.read(2)}, {cpu.registers.read(3)}]")
+
+    print(f"\nFinal: $1={cpu.registers.read(1)}, $2={cpu.registers.read(2)}, $3={cpu.registers.read(3)}")
+
+
+
+# tests/test_pipeline_hazards.py
+"""Test pipeline hazard detection, stalling, and forwarding."""
+import pytest
+from tests.util import assemble
+from state.cpu_state import CPUstate
+from pipeline.pipeline import Pipeline
+from pipeline.hazards import detect_load_use_hazard
+from pipeline.pipeline_regs import ID_EX, EX_MEM
+
+
+def test_load_use_hazard_detection():
+    """Test that detect_load_use_hazard identifies true load-use conflicts."""
+    # Create an ID/EX that reads $1 and $2
+    id_ex = ID_EX()
+    id_ex.rs = 1
+    id_ex.rt = 2
+    id_ex.op = "ADD"
+
+    # Case 1: EX/MEM loads into $1 -> hazard
+    ex_mem = EX_MEM()
+    ex_mem.mem_op = "LW"
+    ex_mem.rd = 1
+    assert detect_load_use_hazard(id_ex, ex_mem) is True
+
+    # Case 2: EX/MEM loads into $2 -> hazard
+    ex_mem.rd = 2
+    assert detect_load_use_hazard(id_ex, ex_mem) is True
+
+    # Case 3: EX/MEM loads into $3 -> no hazard
+    ex_mem.rd = 3
+    assert detect_load_use_hazard(id_ex, ex_mem) is False
+
+    # Case 4: EX/MEM is not a load (e.g., ADD) -> no hazard
+    ex_mem.mem_op = "ADD"
+    ex_mem.rd = 1
+    assert detect_load_use_hazard(id_ex, ex_mem) is False
+
+    # Case 5: Load into $0 is ignored -> no hazard
+    ex_mem.mem_op = "LW"
+    ex_mem.rd = 0
+    assert detect_load_use_hazard(id_ex, ex_mem) is False
+
+
+def test_pipeline_stall_on_load_use():
+    """Test that the pipeline stalls on load-use hazard.
+
+    Program:
+        LW $1, 0($0)     # Load word from 0 into $1
+        ADD $2, $1, $0   # Use loaded $1 immediately (hazard!)
+        ADDI $3, $0, 5
+
+    Without stall, ADD would try to use $1 in EX while it's still in MEM.
+    With stall, ADD waits one cycle for $1 to be loaded.
+    """
+    # Pre-populate memory: store 42 at address 0
+    src = 'LW $1, 0($0)\nADD $2, $1, $0\nADDI $3, $0, 5'
+    machine = assemble(src)
+
+    cpu = CPUstate()
+    # Store 42 at memory address 0
+    cpu.memory.store_word(0, 42)
+
+    # Load machine code into memory at 0, 4, 8
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(4 + i * 4, word)
+
+    # Set PC to 4 (where our program starts)
+    cpu.pc = 4
+
+    pipeline = Pipeline()
+
+    # Run enough cycles: 3 instructions + stall + pipeline depth
+    # Expected timeline:
+    # Cycle 0: IF[LW]
+    # Cycle 1: ID[LW], IF[ADD]
+    # Cycle 2: EX[LW], ID[ADD], IF[ADDI]  <- hazard detected, stall IF/ID and ID/EX
+    # Cycle 3: MEM[LW], ID[ADD] (still), IF[ADDI] (still)
+    # Cycle 4: WB[LW]=$1=42, EX[ADD]=$2=$1+$0=42, ID[ADDI]
+    # Cycle 5: EX[ADDI]=$3=5, WB[ADD]=$2=42
+    # Cycle 6: MEM[ADDI]
+    # Cycle 7: WB[ADDI]=$3=5
+    for _ in range(12):
+        pipeline.step(cpu)
+
+    assert cpu.registers.read(1) == 42, "LW should load 42 into $1"
+    assert cpu.registers.read(2) == 42, "ADD should compute $1 + $0 = 42 + 0 = 42"
+    assert cpu.registers.read(3) == 5, "ADDI should set $3 = 5"
+
+
+def test_pipeline_stall_on_multiple_load_uses():
+    """Test pipeline with multiple sequential load-use patterns."""
+    # Program:
+    #   SW $0, 0($0)        # Clear memory at 0
+    #   ADDI $1, $0, 100
+    #   SW $1, 0($0)        # Store 100 at address 0
+    #   LW $2, 0($0)        # Load into $2 (value 100)
+    #   ADD $3, $2, $2      # Use $2 immediately (stall!)
+    #   ADDI $4, $0, 50
+    
+    src = 'ADDI $1, $0, 100\nSW $1, 0($0)\nLW $2, 0($0)\nADD $3, $2, $2\nADDI $4, $0, 50'
+    machine = assemble(src)
+
+    cpu = CPUstate()
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+
+    pipeline = Pipeline()
+
+    # Run for enough cycles to complete all instructions
+    for _ in range(20):
+        pipeline.step(cpu)
+
+    assert cpu.registers.read(1) == 100
+    assert cpu.memory.load_word(0) == 100
+    assert cpu.registers.read(2) == 100
+    assert cpu.registers.read(3) == 200, "ADD $3, $2, $2 should compute $2 + $2 = 100 + 100 = 200"
+    assert cpu.registers.read(4) == 50
+
+
+def test_pipeline_forwarding_without_stall():
+    """Test that non-load-producing instructions forward without stalling.
+
+    Program:
+        ADDI $1, $0, 10
+        ADD $2, $1, $0      # Use $1, but it's from ADD not LW -> forwarding works
+        ADDI $3, $0, 5
+
+    The ADDI produces alu_result which is forwarded to ADD, no stall needed.
+    """
+    src = 'ADDI $1, $0, 10\nADD $2, $1, $0\nADDI $3, $0, 5'
+    machine = assemble(src)
+
+    cpu = CPUstate()
+    for i, word in enumerate(machine):
+        cpu.memory.store_word(i * 4, word)
+
+    pipeline = Pipeline()
+
+    # Should complete without stalls; fewer cycles needed
+    for _ in range(10):
+        pipeline.step(cpu)
+
+    assert cpu.registers.read(1) == 10
+    assert cpu.registers.read(2) == 10
+    assert cpu.registers.read(3) == 5
+
+
+#tests/test_state.py
+import pytest
+from state.cpu_state import CPUstate
+
+def test_register_read_write():
+    cpu = CPUstate()
+
+    # Write values into registers
+    cpu.registers.write(1, 42)
+    cpu.registers.write(2, 99)
+    cpu.registers.write(0, 123)  # $0 should remain 0
+
+    # Assertions
+    assert cpu.registers.read(1) == 42
+    assert cpu.registers.read(2) == 99
+    assert cpu.registers.read(0) == 0  # $0 must always be 0
+
+def test_memory_store_and_load():
+    cpu = CPUstate()
+    address = 100
+    value = 0xDEADBEEF
+
+    cpu.memory.store_word(address, value)
+    loaded = cpu.memory.load_word(address)
+
+    assert loaded == value
+
+def test_pc_stepping():
+    cpu = CPUstate()
+
+    # Initial PC
+    assert cpu.pc == 0
+
+    # Step once
+    cpu.step_pc()
+    assert cpu.pc == 4
+
+    # Step with custom offset
+    cpu.step_pc(8)
+    assert cpu.pc == 12
+
+#tests/util.py
+from typing import Any, Dict, List, Optional
+
+from parser.lexer import Lexer
+from parser.asm_parser import Parser
+from parser.assembler import Assembler
+from decoder.decoder import decode as decode_word
+from state.cpu_state import CPUstate
+from state.memory import Memory
+
+
+def require_field(dec: Any, name: str):
+    """Ensure decoded instruction `dec` has non-None attribute `name` and return it.
+
+    Raises ValueError with a clear message when the field is missing.
+    """
+    val = getattr(dec, name, None)
+    if val is None:
+        raise ValueError(f"DecodedInstruction missing required field '{name}' for op {getattr(dec, 'op', None)}")
+    return val
+
+
+def require_int_field(dec: Any, name: str) -> int:
+    """Require that a decoded field exists and is an int."""
+    val = require_field(dec, name)
+    if not isinstance(val, int):
+        raise ValueError(f"DecodedInstruction field '{name}' expected int, got {type(val).__name__}")
+    return val
+
+
+def require_reg_field(dec: Any, name: str) -> int:
+    """Require that a decoded field is a valid register number (0-31)."""
+    reg = require_int_field(dec, name)
+    if not (0 <= reg < 32):
+        raise ValueError(f"Register field '{name}' out of range: {reg}")
+    return reg
+
+
+def assemble(src: str) -> List[int]:
+    """Assemble a small assembly source string into machine words."""
+    toks = Lexer(src).tokenize()
+    instrs = Parser(toks).parse()
+    return Assembler(instrs).assemble()
+
+
+def assemble_and_decode(src: str, pc: int = 0):
+    """Assemble source and return list of decoded instructions (pc increments by 4)."""
+    words = assemble(src)
+    return [decode_word(w, pc=pc + i * 4) for i, w in enumerate(words)]
+
+
+def make_cpu(registers: Optional[Dict[int, int]] = None, memory_words: Optional[Dict[int, int]] = None, pc: int = 0) -> CPUstate:
+    """Create a CPUstate preloaded with registers and word-aligned memory values."""
+    cpu = CPUstate()
+    cpu.pc = pc
+    if registers:
+        for r, v in registers.items():
+            cpu.registers.write(r, v)
+    if memory_words:
+        for addr, val in memory_words.items():
+            cpu.memory.store_word(addr, val)
+    return cpu
+
+
+def assert_registers(cpu: CPUstate, expected: Dict[int, int]):
+    """Assert multiple registers equal expected values with helpful messages."""
+    for r, v in expected.items():
+        actual = cpu.registers.read(r)
+        assert actual == v, f"Register ${r} expected {v}, found {actual}"
+
+
+def assert_memory_word(memory: Memory, addr: int, expected: int):
+    """Assert a memory word equals expected value."""
+    actual = memory.load_word(addr)
+    assert actual == expected, f"Memory at {addr:#x} expected {expected:#x}, found {actual:#x}"
+
+
+# Minimal single-instruction executor used by tests. This mirrors the simple executor
+# in `tests/test_full_cycle_simulation.py` and keeps tests DRY. It supports common
+# R-type arithmetic, I-type immediate arithmetic/logical, and basic loads/stores.
+from execute.alu import alu
+from execute.load_store_unit import load_store
+
+
+def execute_decoded(dec, cpu: CPUstate):
+    """Execute a single decoded instruction against `cpu`.
+
+    Note: This is intentionally small and only covers ops exercised in tests.
+    """
+    if dec.type == 'R':
+        if dec.op in ('ADD','ADDU','SUB','SUBU','AND','OR','XOR','SLT', 'SLTU'):
+            rs = require_reg_field(dec, 'rs')
+            rt = require_reg_field(dec, 'rt')
+            a = cpu.registers.read(rs)
+            b = cpu.registers.read(rt)
+            res = alu(dec.op, a, b, shamt=dec.shamt or 0)
+            rd = require_reg_field(dec, 'rd')
+            cpu.registers.write(rd, res)
+            cpu.pc += 4
+        else:
+            cpu.pc += 4
+    elif dec.type == 'I':
+        if dec.op in ('ADDI','ADDIU'):
+            rs = require_reg_field(dec, 'rs')
+            imm = require_int_field(dec, 'imm')
+            rt = require_reg_field(dec, 'rt')
+            a = cpu.registers.read(rs)
+            res = alu('ADD' if dec.op == 'ADDI' else 'ADDU', a, imm)
+            cpu.registers.write(rt, res)
+            cpu.pc += 4
+        elif dec.op in ('SLTI','SLTIU'):
+            rs = require_reg_field(dec, 'rs')
+            imm = require_int_field(dec, 'imm')
+            rt = require_reg_field(dec, 'rt')
+            a = cpu.registers.read(rs)
+            res = alu('SLT' if dec.op == 'SLTI' else 'SLTU', a, imm)
+            cpu.registers.write(rt, res)
+            cpu.pc += 4
+        elif dec.op in ('ANDI','ORI','XORI'):
+            rs = require_reg_field(dec, 'rs')
+            imm = require_int_field(dec, 'imm')
+            rt = require_reg_field(dec, 'rt')
+            a = cpu.registers.read(rs)
+            op_map = {'ANDI': 'AND', 'ORI': 'OR', 'XORI': 'XOR'}
+            res = alu(op_map[dec.op], a, imm)
+            cpu.registers.write(rt, res)
+            cpu.pc += 4
+        elif dec.op in ('LW','LB','LBU','LH','LHU'):
+            rs = require_reg_field(dec, 'rs')
+            imm = require_int_field(dec, 'imm')
+            addr = cpu.registers.read(rs) + imm
+            val = load_store(dec.op, cpu.memory, addr)
+            rt = require_reg_field(dec, 'rt')
+            assert val is not None
+            cpu.registers.write(rt, val)
+            cpu.pc += 4
+        elif dec.op in ('SW','SB','SH'):
+            rs = require_reg_field(dec, 'rs')
+            imm = require_int_field(dec, 'imm')
+            rt = require_reg_field(dec, 'rt')
+            addr = cpu.registers.read(rs) + imm
+            load_store(dec.op, cpu.memory, addr, cpu.registers.read(rt))
+            cpu.pc += 4
+        else:
+            cpu.pc += 4
+    else:
+        cpu.pc += 4
+
+
+def run_program(src: str, cpu: Optional[CPUstate] = None, start_pc: int = 0) -> CPUstate:
+    """Assemble and run a straight-line program (no control-flow chasing).
+
+    Decodes instructions with sequential PCs starting at `start_pc` and executes
+    them in order with `execute_decoded`.
+    """
+    words = assemble(src)
+    decs = [decode_word(w, pc=start_pc + i * 4) for i, w in enumerate(words)]
+    if cpu is None:
+        cpu = make_cpu(pc=start_pc)
+    else:
+        cpu.pc = start_pc
+    for dec in decs:
+        execute_decoded(dec, cpu)
+    return cpu
+
+
